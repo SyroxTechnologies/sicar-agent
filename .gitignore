@@ -1,0 +1,25 @@
+# Build outputs
+bin/
+obj/
+publish/
+
+# IDE
+*.user
+.vs/
+.vscode/
+.idea/
+
+# Logs
+logs/
+*.log
+
+# Runtime config (generado por el wizard la primera vez — contiene token cifrado)
+config.dat
+appsettings.Local.json
+
+# Agent persistent state (si se copia al dir del proyecto por error)
+*.dat
+
+# OS
+.DS_Store
+Thumbs.db
