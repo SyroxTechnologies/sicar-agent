@@ -23,13 +23,13 @@ Antes de arrancar el agente, necesitás tener **ya corriendo** en tu máquina:
    una copia en un servidor remoto.
 ---
 
-#### Arrancar el agente — Linux / macOS
+#### Arrancar el agente
 
 Requiere [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 
 ### 1. Generá un link-token desde el admin
 
-- Desde /admin/sucursales → si no hay sucursales creadas, creá una 
+- Desde /admin/sucursales → si no hay sucursales creadas, creá una
 - En cualquier sucursal, click en el ícono de integración (cadena) → **"Generar token de vinculación"**.
 - Copiás el hex de 64 caracteres. Expira en 60 minutos y se usa una sola vez.
 
@@ -45,7 +45,6 @@ export DOTNET_ENVIRONMENT=Development
 export STOCKANDRIA_LINK_TOKEN="pega-el-token-aca"
 
 # Conexión al MySQL de SICAR (¡SIN Database= al final!)
-# Ejemplo con MySQL local:
 export STOCKANDRIA_SICAR_BASE_CONNECTION_STRING="Server=localhost;Port=3306;Uid=root;Pwd=TU_PASS;"
 ```
 
@@ -55,44 +54,15 @@ export STOCKANDRIA_SICAR_BASE_CONNECTION_STRING="Server=localhost;Port=3306;Uid=
 dotnet run --project src/StockandriaAgent
 ```
 
-> **En Linux/macOS**: como DPAPI solo existe en Windows, el agente guarda el
-> `config.dat` en **plaintext** con permisos `0600`. Queda el warning en los
-> logs — es modo dev, no apto para producción.
+#### Diferencias entre Linux/macOS y Windows
 
----
-
-#### Arrancar el agente — Windows
-
-Igual que Linux pero con sintaxis PowerShell. Requiere también [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
-
-```powershell
-$env:DOTNET_ENVIRONMENT = "Development"
-$env:STOCKANDRIA_LINK_TOKEN = "pega-el-token-aca"
-$env:STOCKANDRIA_SICAR_BASE_CONNECTION_STRING = "Server=localhost;Port=3306;Uid=root;Pwd=TU_PASS;"
-
-dotnet run --project src/StockandriaAgent
-```
-
-En Windows usa **DPAPI** para cifrar el token y la connection string — eso es
-producción real (los datos nunca quedan legibles en disco).
-
-### Opcional — instalar como servicio de Windows
-
-Para que el agente arranque con el sistema y quede corriendo en segundo plano
-permanentemente (como haría un cliente en producción):
-
-```powershell
-# En PowerShell como Administrador, desde la raíz del repo:
-.\install.ps1 -LinkToken "pega-el-token-aca"
-```
-
-El script compila el binario self-contained, lo copia a
-`C:\Program Files\StockandriaAgent\`, y crea el servicio `StockandriaAgent`.
-
-Para desinstalar:
-```powershell
-.\uninstall.ps1
-```
+- **Variables de entorno**: Linux/macOS usa `export VAR=valor`. Windows (PowerShell) usa `$env:VAR = "valor"`.
+- **Cifrado del `config.dat`**: Windows usa **DPAPI** (producción real, los datos nunca quedan legibles en disco). Linux/macOS usa **plaintext con permisos `0600`** — es modo dev, aparece un warning en los logs.
+- **Instalar como servicio en Windows** (opcional, para que arranque con el sistema): desde PowerShell como administrador, en la raíz del repo:
+  ```powershell
+  .\install.ps1 -LinkToken "pega-el-token-aca"
+  ```
+  Desinstala con `.\uninstall.ps1`.
 
 ---
 
