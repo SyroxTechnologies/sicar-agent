@@ -21,36 +21,28 @@ public class CommandDispatcher
         _logger.LogInformation("Ejecutando comando {CommandId} tipo {Type}", command.Id, command.Type);
         try
         {
+            var payload = OptionalPayload(command);
+
             return command.Type switch
             {
-                "TEST_CONNECTION" => await HandleTestConnection(ct),
-                "GET_STATUS" => CommandResult.Ok(await _sicar.GetStatusAsync(ct)),
-                "SYNC_PRODUCTS" => CommandResult.Ok(await _sicar.SyncProductsAsync(ct)),
-                "SYNC_STOCK" => CommandResult.Ok(await _sicar.SyncStockAsync(ct)),
-                "SYNC_SUPPLIERS" => CommandResult.Ok(await _sicar.SyncSuppliersAsync(ct)),
-                "CREATE_BACKUP" => CommandResult.Ok(await _sicar.CreateBackupAsync(ct)),
+                "TEST_CONNECTION" => await HandleTestConnection(payload, ct),
+                "GET_STATUS" => CommandResult.Ok(await _sicar.GetStatusAsync(payload, ct)),
+                "SYNC_PRODUCTS" => CommandResult.Ok(await _sicar.SyncProductsAsync(payload, ct)),
+                "SYNC_STOCK" => CommandResult.Ok(await _sicar.SyncStockAsync(payload, ct)),
+                "SYNC_SUPPLIERS" => CommandResult.Ok(await _sicar.SyncSuppliersAsync(payload, ct)),
+                "CREATE_BACKUP" => CommandResult.Ok(await _sicar.CreateBackupAsync(payload, ct)),
 
-                "ADJUST_STOCK" => CommandResult.Ok(
-                    await _sicar.AdjustStockAsync(RequirePayload(command), ct)),
-                "BULK_ADJUST_STOCK" => CommandResult.Ok(
-                    await _sicar.BulkAdjustStockAsync(RequirePayload(command), ct)),
-                "UPDATE_PRICE" => CommandResult.Ok(
-                    await _sicar.UpdatePriceAsync(RequirePayload(command), ct)),
-                "UPDATE_MIN_MAX" => CommandResult.Ok(
-                    await _sicar.UpdateMinMaxAsync(RequirePayload(command), ct)),
-                "TRANSFER_STOCK" => CommandResult.Ok(
-                    await _sicar.TransferStockAsync(RequirePayload(command), ct)),
-                "UPDATE_SUPPLIER" => CommandResult.Ok(
-                    await _sicar.UpdateSupplierAsync(RequirePayload(command), ct)),
+                "ADJUST_STOCK" => CommandResult.Ok(await _sicar.AdjustStockAsync(payload, ct)),
+                "BULK_ADJUST_STOCK" => CommandResult.Ok(await _sicar.BulkAdjustStockAsync(payload, ct)),
+                "UPDATE_PRICE" => CommandResult.Ok(await _sicar.UpdatePriceAsync(payload, ct)),
+                "UPDATE_MIN_MAX" => CommandResult.Ok(await _sicar.UpdateMinMaxAsync(payload, ct)),
+                "TRANSFER_STOCK" => CommandResult.Ok(await _sicar.TransferStockAsync(payload, ct)),
+                "UPDATE_SUPPLIER" => CommandResult.Ok(await _sicar.UpdateSupplierAsync(payload, ct)),
 
-                "GET_PRODUCTS" => CommandResult.Ok(
-                    await _sicar.GetProductsAsync(OptionalPayload(command), ct)),
-                "GET_STOCK" => CommandResult.Ok(
-                    await _sicar.GetStockAsync(OptionalPayload(command), ct)),
-                "GET_TRANSFERS" => CommandResult.Ok(
-                    await _sicar.GetTransfersAsync(OptionalPayload(command), ct)),
-                "GET_SUPPLIERS" => CommandResult.Ok(
-                    await _sicar.GetSuppliersAsync(OptionalPayload(command), ct)),
+                "GET_PRODUCTS" => CommandResult.Ok(await _sicar.GetProductsAsync(payload, ct)),
+                "GET_STOCK" => CommandResult.Ok(await _sicar.GetStockAsync(payload, ct)),
+                "GET_TRANSFERS" => CommandResult.Ok(await _sicar.GetTransfersAsync(payload, ct)),
+                "GET_SUPPLIERS" => CommandResult.Ok(await _sicar.GetSuppliersAsync(payload, ct)),
 
                 _ => UnknownCommand(command.Type),
             };
@@ -66,29 +58,21 @@ public class CommandDispatcher
         }
     }
 
-    private async Task<CommandResult> HandleTestConnection(CancellationToken ct)
+    private async Task<CommandResult> HandleTestConnection(JsonElement payload, CancellationToken ct)
     {
-        var result = await _sicar.TestConnectionAsync(ct);
+        var result = await _sicar.TestConnectionAsync(payload, ct);
         return result.Reachable
             ? CommandResult.Ok(new { reachable = true })
             : CommandResult.Fail(result.Error ?? "SICAR inaccesible", new { reachable = false });
-    }
-
-    private static JsonElement RequirePayload(BackendCommand command)
-    {
-        if (command.Payload is null || command.Payload.Value.ValueKind == JsonValueKind.Null)
-        {
-            throw new InvalidOperationException($"Comando {command.Type} requiere payload");
-        }
-        return command.Payload.Value;
     }
 
     private static JsonElement OptionalPayload(BackendCommand command)
     {
         if (command.Payload is null || command.Payload.Value.ValueKind == JsonValueKind.Null)
         {
-            // Devolvemos un objeto JSON vacio para que los TryGetProperty del adapter
-            // devuelvan false en lugar de lanzar excepcion.
+            // Objeto JSON vacío — los TryGetProperty del adapter devuelven false
+            // cuando la propiedad no existe. Si el comando requiere databaseName,
+            // RequireDatabaseName lanza una excepción clara.
             using var doc = JsonDocument.Parse("{}");
             return doc.RootElement.Clone();
         }

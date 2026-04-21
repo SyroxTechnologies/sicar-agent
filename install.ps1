@@ -22,10 +22,10 @@ $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $publishDir = Join-Path $scriptRoot "publish"
 
 if (-not (Test-Path $publishDir)) {
-    Write-Host "No se encontro $publishDir. Generando build de release..."
+    Write-Host "No se encontro $publishDir. Generando build de release (self-contained, no requiere .NET)..."
     Push-Location $scriptRoot
     try {
-        dotnet publish src/StockandriaAgent/StockandriaAgent.csproj -c Release -r win-x64 --self-contained false -o $publishDir
+        dotnet publish src/StockandriaAgent/StockandriaAgent.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o $publishDir
         if ($LASTEXITCODE -ne 0) {
             Write-Error "La compilacion fallo."
             exit 1

@@ -5,12 +5,25 @@ using MySqlConnector;
 namespace StockandriaAgent.Services;
 
 /// <summary>
-/// Implementación real de <see cref="ISicarAdapter"/> contra la DB MariaDB/MySQL
-/// local de SICAR. Regla estricta: solo SELECT y UPDATE. Nunca INSERT ni DELETE
-/// — la auditoría vive en Stockandria, no en SICAR.
+/// Implementación real de <see cref="ISicarAdapter"/> contra el servidor
+/// MariaDB/MySQL local de SICAR. En el modelo multi-sucursal, el servidor
+/// aloja varias DBs (una por sucursal: sicar_norte, sicar_chihuahua, etc.).
+/// Cada comando incluye en su payload un campo `databaseName` que el adapter
+/// usa para armar la connection string contra esa DB puntual.
+///
+/// Regla estricta: solo SELECT y UPDATE. Nunca INSERT ni DELETE — la
+/// auditoría vive en Stockandria, no en SICAR.
 /// </summary>
 public class SicarAdapter : ISicarAdapter
 {
+    private static readonly HashSet<string> SystemDatabases = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "information_schema",
+        "mysql",
+        "performance_schema",
+        "sys",
+    };
+
     private readonly AgentSession _session;
     private readonly ILogger<SicarAdapter> _logger;
 
@@ -20,25 +33,39 @@ public class SicarAdapter : ISicarAdapter
         _logger = logger;
     }
 
-    private async Task<MySqlConnection> OpenAsync(CancellationToken ct)
+    /// <summary>
+    /// Abre conexión contra el servidor MySQL. Si se pasa <paramref name="databaseName"/>,
+    /// concatena `;Database={databaseName}` a la base connection string.
+    /// </summary>
+    private async Task<MySqlConnection> OpenAsync(string? databaseName, CancellationToken ct)
     {
         var config = await _session.WaitForConfigAsync(ct);
-        if (string.IsNullOrWhiteSpace(config.SicarConnectionString))
+        if (string.IsNullOrWhiteSpace(config.SicarBaseConnectionString))
         {
             throw new InvalidOperationException(
-                "SicarConnectionString no está configurada. Ejecutar el wizard de configuración del agente.");
+                "SicarBaseConnectionString no está configurada. Ejecutar el wizard del agente.");
         }
 
-        var conn = new MySqlConnection(config.SicarConnectionString);
+        var cs = config.SicarBaseConnectionString;
+        if (!string.IsNullOrWhiteSpace(databaseName))
+        {
+            cs = cs.TrimEnd(';') + $";Database={databaseName};";
+        }
+
+        var conn = new MySqlConnection(cs);
         await conn.OpenAsync(ct);
         return conn;
     }
 
-    public async Task<SicarReachability> TestConnectionAsync(CancellationToken ct)
+    public async Task<SicarReachability> TestConnectionAsync(JsonElement? payload, CancellationToken ct)
     {
         try
         {
-            await using var conn = await OpenAsync(ct);
+            var databaseName = payload is JsonElement p
+                ? GetOptionalString(p, "databaseName")
+                : null;
+
+            await using var conn = await OpenAsync(databaseName, ct);
             await using var cmd = new MySqlCommand("SELECT 1", conn);
             await cmd.ExecuteScalarAsync(ct);
             return new SicarReachability(true, null);
@@ -50,9 +77,28 @@ public class SicarAdapter : ISicarAdapter
         }
     }
 
-    public async Task<object> GetStatusAsync(CancellationToken ct)
+    public async Task<List<string>> ListDatabasesAsync(CancellationToken ct)
     {
-        await using var conn = await OpenAsync(ct);
+        await using var conn = await OpenAsync(null, ct);
+        await using var cmd = new MySqlCommand("SHOW DATABASES", conn);
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+        var databases = new List<string>();
+        while (await reader.ReadAsync(ct))
+        {
+            var name = reader.GetString(0);
+            if (!SystemDatabases.Contains(name))
+            {
+                databases.Add(name);
+            }
+        }
+        return databases;
+    }
+
+    public async Task<object> GetStatusAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+        await using var conn = await OpenAsync(db, ct);
 
         var version = await ScalarString(conn, "SELECT VERSION()", ct);
         var articlesCount = await ScalarLong(conn, "SELECT COUNT(*) FROM articulo", ct);
@@ -61,6 +107,7 @@ public class SicarAdapter : ISicarAdapter
 
         return new
         {
+            database = db,
             sicarVersion = version,
             articlesCount,
             suppliersCount,
@@ -68,9 +115,10 @@ public class SicarAdapter : ISicarAdapter
         };
     }
 
-    public async Task<object> SyncProductsAsync(CancellationToken ct)
+    public async Task<object> SyncProductsAsync(JsonElement payload, CancellationToken ct)
     {
-        await using var conn = await OpenAsync(ct);
+        var db = RequireDatabaseName(payload);
+        await using var conn = await OpenAsync(db, ct);
         var products = new List<Dictionary<string, object?>>();
 
         const string sql = @"
@@ -91,12 +139,13 @@ public class SicarAdapter : ISicarAdapter
             products.Add(ReadRow(reader));
         }
 
-        return new { syncedCount = products.Count, products };
+        return new { database = db, syncedCount = products.Count, products };
     }
 
-    public async Task<object> SyncStockAsync(CancellationToken ct)
+    public async Task<object> SyncStockAsync(JsonElement payload, CancellationToken ct)
     {
-        await using var conn = await OpenAsync(ct);
+        var db = RequireDatabaseName(payload);
+        await using var conn = await OpenAsync(db, ct);
         var stock = new List<Dictionary<string, object?>>();
 
         const string sql = @"
@@ -111,16 +160,15 @@ public class SicarAdapter : ISicarAdapter
             stock.Add(ReadRow(reader));
         }
 
-        return new { syncedCount = stock.Count, stock };
+        return new { database = db, syncedCount = stock.Count, stock };
     }
 
-    public async Task<object> SyncSuppliersAsync(CancellationToken ct)
+    public async Task<object> SyncSuppliersAsync(JsonElement payload, CancellationToken ct)
     {
-        await using var conn = await OpenAsync(ct);
+        var db = RequireDatabaseName(payload);
+        await using var conn = await OpenAsync(db, ct);
         var suppliers = new List<Dictionary<string, object?>>();
 
-        // SICAR usa `domicilio` y `mail` (no `direccion`/`correo`).
-        // Aliaseamos para que el backend reciba siempre los mismos nombres.
         const string sql = @"
             SELECT pro_id,
                    nombre,
@@ -140,12 +188,13 @@ public class SicarAdapter : ISicarAdapter
             suppliers.Add(ReadRow(reader));
         }
 
-        return new { syncedCount = suppliers.Count, suppliers };
+        return new { database = db, syncedCount = suppliers.Count, suppliers };
     }
 
-    public Task<object> CreateBackupAsync(CancellationToken ct)
+    public Task<object> CreateBackupAsync(JsonElement payload, CancellationToken ct)
     {
         // TODO: implementar con mysqldump o equivalente + presigned URL.
+        // El db en cuestión está en payload.databaseName.
         throw new NotImplementedException("CreateBackup todavía no está implementado");
     }
 
@@ -155,10 +204,11 @@ public class SicarAdapter : ISicarAdapter
 
     public async Task<object> AdjustStockAsync(JsonElement payload, CancellationToken ct)
     {
+        var db = RequireDatabaseName(payload);
         var artId = payload.GetProperty("artId").GetInt32();
         var newStock = payload.GetProperty("newStock").GetInt32();
 
-        await using var conn = await OpenAsync(ct);
+        await using var conn = await OpenAsync(db, ct);
         await using var cmd = new MySqlCommand(
             "UPDATE articulo SET existencia = @stock WHERE art_id = @id",
             conn);
@@ -166,21 +216,22 @@ public class SicarAdapter : ISicarAdapter
         cmd.Parameters.AddWithValue("@id", artId);
         var rows = await cmd.ExecuteNonQueryAsync(ct);
 
-        _logger.LogInformation("ADJUST_STOCK art_id={ArtId} newStock={NewStock} rows={Rows}",
-            artId, newStock, rows);
+        _logger.LogInformation("ADJUST_STOCK db={Db} art_id={ArtId} newStock={NewStock} rows={Rows}",
+            db, artId, newStock, rows);
 
         return new { artId, newStock, rowsAffected = rows };
     }
 
     public async Task<object> BulkAdjustStockAsync(JsonElement payload, CancellationToken ct)
     {
+        var db = RequireDatabaseName(payload);
         var adjustments = payload.GetProperty("adjustments");
         if (adjustments.ValueKind != JsonValueKind.Array)
         {
             throw new InvalidOperationException("payload.adjustments debe ser un array");
         }
 
-        await using var conn = await OpenAsync(ct);
+        await using var conn = await OpenAsync(db, ct);
         await using var tx = await conn.BeginTransactionAsync(ct);
 
         var results = new List<object>();
@@ -213,6 +264,7 @@ public class SicarAdapter : ISicarAdapter
 
     public async Task<object> UpdatePriceAsync(JsonElement payload, CancellationToken ct)
     {
+        var db = RequireDatabaseName(payload);
         var artId = payload.GetProperty("artId").GetInt32();
         var prices = payload.GetProperty("prices");
 
@@ -233,18 +285,19 @@ public class SicarAdapter : ISicarAdapter
             throw new InvalidOperationException("No se envió ningún precio para actualizar");
         }
 
-        await using var conn = await OpenAsync(ct);
+        await using var conn = await OpenAsync(db, ct);
         cmd.Connection = conn;
         cmd.CommandText = $"UPDATE articulo SET {string.Join(", ", sets)} WHERE art_id = @id";
         cmd.Parameters.AddWithValue("@id", artId);
 
         var rows = await cmd.ExecuteNonQueryAsync(ct);
-        _logger.LogInformation("UPDATE_PRICE art_id={ArtId} rows={Rows}", artId, rows);
+        _logger.LogInformation("UPDATE_PRICE db={Db} art_id={ArtId} rows={Rows}", db, artId, rows);
         return new { artId, rowsAffected = rows };
     }
 
     public async Task<object> UpdateMinMaxAsync(JsonElement payload, CancellationToken ct)
     {
+        var db = RequireDatabaseName(payload);
         var artId = payload.GetProperty("artId").GetInt32();
         var values = payload.GetProperty("values");
 
@@ -267,20 +320,19 @@ public class SicarAdapter : ISicarAdapter
             throw new InvalidOperationException("No se envió invMin ni invMax");
         }
 
-        await using var conn = await OpenAsync(ct);
+        await using var conn = await OpenAsync(db, ct);
         cmd.Connection = conn;
         cmd.CommandText = $"UPDATE articulo SET {string.Join(", ", sets)} WHERE art_id = @id";
         cmd.Parameters.AddWithValue("@id", artId);
 
         var rows = await cmd.ExecuteNonQueryAsync(ct);
-        _logger.LogInformation("UPDATE_MIN_MAX art_id={ArtId} rows={Rows}", artId, rows);
+        _logger.LogInformation("UPDATE_MIN_MAX db={Db} art_id={ArtId} rows={Rows}", db, artId, rows);
         return new { artId, rowsAffected = rows };
     }
 
     public async Task<object> TransferStockAsync(JsonElement payload, CancellationToken ct)
     {
-        // El backend encola DOS comandos (uno por sucursal) — cada agente recibe
-        // solo el lado que le toca. El campo direction decide si se resta o se suma.
+        var db = RequireDatabaseName(payload);
         var direction = payload.TryGetProperty("direction", out var dirVal)
             && dirVal.ValueKind == JsonValueKind.String
             ? dirVal.GetString()
@@ -302,7 +354,7 @@ public class SicarAdapter : ISicarAdapter
             ? "UPDATE articulo SET existencia = GREATEST(existencia - @qty, 0) WHERE art_id = @id"
             : "UPDATE articulo SET existencia = existencia + @qty WHERE art_id = @id";
 
-        await using var conn = await OpenAsync(ct);
+        await using var conn = await OpenAsync(db, ct);
         await using var tx = await conn.BeginTransactionAsync(ct);
 
         var results = new List<object>();
@@ -329,12 +381,13 @@ public class SicarAdapter : ISicarAdapter
         }
 
         _logger.LogInformation(
-            "TRANSFER_STOCK ejecutado ({Direction}) con {Count} items", direction, results.Count);
+            "TRANSFER_STOCK db={Db} ({Direction}) con {Count} items", db, direction, results.Count);
         return new { direction, results };
     }
 
     public async Task<object> UpdateSupplierAsync(JsonElement payload, CancellationToken ct)
     {
+        var db = RequireDatabaseName(payload);
         var proId = payload.GetProperty("proId").GetInt32();
         var fields = payload.GetProperty("fields");
 
@@ -356,29 +409,29 @@ public class SicarAdapter : ISicarAdapter
             throw new InvalidOperationException("No se envió ningún campo para actualizar");
         }
 
-        await using var conn = await OpenAsync(ct);
+        await using var conn = await OpenAsync(db, ct);
         cmd.Connection = conn;
         cmd.CommandText = $"UPDATE proveedor SET {string.Join(", ", sets)} WHERE pro_id = @id";
         cmd.Parameters.AddWithValue("@id", proId);
 
         var rows = await cmd.ExecuteNonQueryAsync(ct);
-        _logger.LogInformation("UPDATE_SUPPLIER pro_id={ProId} rows={Rows}", proId, rows);
+        _logger.LogInformation("UPDATE_SUPPLIER db={Db} pro_id={ProId} rows={Rows}", db, proId, rows);
         return new { proId, rowsAffected = rows };
     }
 
     // -------------------------------------------------------------------------
-    // Operaciones de lectura — SOLO SELECT. Reemplazan el Prisma directo del
-    // backend. Cada comando usa payload.mode para elegir la variante.
+    // Operaciones de lectura — SOLO SELECT.
     // -------------------------------------------------------------------------
 
     public async Task<object> GetProductsAsync(JsonElement payload, CancellationToken ct)
     {
+        var db = RequireDatabaseName(payload);
         var mode = GetMode(payload);
 
         if (mode == "detail")
         {
             var artId = payload.GetProperty("artId").GetInt32();
-            await using var conn = await OpenAsync(ct);
+            await using var conn = await OpenAsync(db, ct);
 
             const string sql = @"
                 SELECT a.art_id, a.clave, a.descripcion, a.precioCompra, a.precio1, a.precio2,
@@ -405,7 +458,7 @@ public class SicarAdapter : ISicarAdapter
 
         if (mode == "categories")
         {
-            await using var conn = await OpenAsync(ct);
+            await using var conn = await OpenAsync(db, ct);
             var categories = new List<Dictionary<string, object?>>();
 
             const string sql = @"
@@ -431,7 +484,7 @@ public class SicarAdapter : ISicarAdapter
         var search = GetOptionalString(payload, "search");
         var catId = GetOptionalInt(payload, "catId");
 
-        await using var listConn = await OpenAsync(ct);
+        await using var listConn = await OpenAsync(db, ct);
 
         var where = "WHERE a.status = 1";
         var parameters = new List<(string Name, object Value)>();
@@ -489,12 +542,13 @@ public class SicarAdapter : ISicarAdapter
 
     public async Task<object> GetStockAsync(JsonElement payload, CancellationToken ct)
     {
+        var db = RequireDatabaseName(payload);
         var mode = GetMode(payload);
 
         if (mode == "detail")
         {
             var artId = payload.GetProperty("artId").GetInt32();
-            await using var conn = await OpenAsync(ct);
+            await using var conn = await OpenAsync(db, ct);
 
             const string sql = @"
                 SELECT art_id, clave, descripcion, existencia, invMin, invMax
@@ -518,7 +572,7 @@ public class SicarAdapter : ISicarAdapter
         var search = GetOptionalString(payload, "search");
         var belowMin = GetOptionalBool(payload, "belowMin") ?? false;
 
-        await using var listConn = await OpenAsync(ct);
+        await using var listConn = await OpenAsync(db, ct);
 
         var where = "WHERE a.status = 1";
         var parameters = new List<(string Name, object Value)>();
@@ -574,10 +628,11 @@ public class SicarAdapter : ISicarAdapter
 
     public async Task<object> GetTransfersAsync(JsonElement payload, CancellationToken ct)
     {
+        var db = RequireDatabaseName(payload);
         var (page, limit, skip) = GetPagination(payload, defaultLimit: 20, maxLimit: 100);
         var status = GetOptionalInt(payload, "status");
 
-        await using var conn = await OpenAsync(ct);
+        await using var conn = await OpenAsync(db, ct);
 
         var where = "";
         var parameters = new List<(string Name, object Value)>();
@@ -627,12 +682,13 @@ public class SicarAdapter : ISicarAdapter
 
     public async Task<object> GetSuppliersAsync(JsonElement payload, CancellationToken ct)
     {
+        var db = RequireDatabaseName(payload);
         var mode = GetMode(payload);
 
         if (mode == "detail")
         {
             var proId = payload.GetProperty("proId").GetInt32();
-            await using var conn = await OpenAsync(ct);
+            await using var conn = await OpenAsync(db, ct);
 
             const string sql = @"
                 SELECT pro_id, nombre, alias, representante, domicilio, noExt, noInt,
@@ -657,7 +713,7 @@ public class SicarAdapter : ISicarAdapter
         var (page, limit, skip) = GetPagination(payload, defaultLimit: 50, maxLimit: 200);
         var search = GetOptionalString(payload, "search");
 
-        await using var listConn = await OpenAsync(ct);
+        await using var listConn = await OpenAsync(db, ct);
 
         var where = "WHERE status = 1";
         var parameters = new List<(string Name, object Value)>();
@@ -710,6 +766,18 @@ public class SicarAdapter : ISicarAdapter
     // Helpers
     // -------------------------------------------------------------------------
 
+    private static string RequireDatabaseName(JsonElement payload)
+    {
+        if (payload.TryGetProperty("databaseName", out var val) &&
+            val.ValueKind == JsonValueKind.String)
+        {
+            var name = val.GetString();
+            if (!string.IsNullOrWhiteSpace(name)) return name!;
+        }
+        throw new InvalidOperationException(
+            "El payload no incluye 'databaseName'. La sucursal debe tener una DB SICAR vinculada en Stockandria.");
+    }
+
     private static string GetMode(JsonElement payload)
     {
         if (payload.TryGetProperty("mode", out var val) && val.ValueKind == JsonValueKind.String)
@@ -759,7 +827,6 @@ public class SicarAdapter : ISicarAdapter
         }
         return null;
     }
-
 
     private static async Task<string> ScalarString(MySqlConnection conn, string sql, CancellationToken ct)
     {

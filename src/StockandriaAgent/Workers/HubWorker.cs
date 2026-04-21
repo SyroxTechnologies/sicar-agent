@@ -197,10 +197,13 @@ public class HubWorker : BackgroundService
 
         var version = typeof(HubWorker).Assembly.GetName().Version?.ToString() ?? "0.0.0";
 
+        // Heartbeat: probamos conectividad al servidor MySQL base (sin database).
+        // Esto verifica que el agente pueda alcanzar el MySQL; el chequeo por DB
+        // específica se hace en cada comando individual.
         SicarReachability reachability;
         try
         {
-            reachability = await _sicar.TestConnectionAsync(ct);
+            reachability = await _sicar.TestConnectionAsync(null, ct);
         }
         catch (Exception ex)
         {

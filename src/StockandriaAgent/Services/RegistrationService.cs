@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using MySqlConnector;
 using StockandriaAgent.Models;
 
 namespace StockandriaAgent.Services;
@@ -10,6 +11,14 @@ namespace StockandriaAgent.Services;
 public class RegistrationService : BackgroundService
 {
     private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(30);
+
+    private static readonly HashSet<string> SystemDatabases = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "information_schema",
+        "mysql",
+        "performance_schema",
+        "sys",
+    };
 
     private readonly IConfigStorage _storage;
     private readonly AgentSession _session;
@@ -37,18 +46,18 @@ public class RegistrationService : BackgroundService
         if (existing != null)
         {
             _logger.LogInformation(
-                "Configuración cargada: agentId={AgentId}, branchId={BranchId}",
+                "Configuración cargada: agentId={AgentId}, orgId={OrgId}",
                 existing.AgentId,
-                existing.BranchId);
+                existing.OrganizationId);
 
-            // Si la config previa no tiene SicarConnectionString (formato viejo),
-            // intentamos resolverla ahora para no dejar al agente en un estado
-            // semi-configurado.
-            if (string.IsNullOrWhiteSpace(existing.SicarConnectionString))
+            // Si la config previa no tiene SicarBaseConnectionString (o tiene una
+            // del formato viejo con Database= adentro), corremos el wizard para
+            // regenerarla en formato nuevo.
+            if (string.IsNullOrWhiteSpace(existing.SicarBaseConnectionString))
             {
                 _logger.LogWarning(
-                    "La configuración cargada no tiene SicarConnectionString. Ejecutando wizard.");
-                existing.SicarConnectionString = ResolveSicarConnectionString();
+                    "La configuración cargada no tiene SicarBaseConnectionString. Ejecutando wizard.");
+                existing.SicarBaseConnectionString = ResolveSicarBaseConnectionString();
                 await _storage.SaveAsync(existing, stoppingToken);
             }
 
@@ -68,15 +77,24 @@ public class RegistrationService : BackgroundService
                 if (string.IsNullOrWhiteSpace(linkToken))
                 {
                     _logger.LogWarning(
-                        "No se encontró link token. Definí la variable STOCKANDRIA_LINK_TOKEN o configurala en Backend:LinkToken. Reintentando en {Delay}s.",
+                        "No se encontró link token. Definí STOCKANDRIA_LINK_TOKEN o configurala en Backend:LinkToken. Reintentando en {Delay}s.",
                         RetryDelay.TotalSeconds);
                     await Task.Delay(RetryDelay, stoppingToken);
                     continue;
                 }
 
-                // Pedimos la connection string ANTES del registro en el backend
-                // para no dejar al agente vinculado pero sin acceso a SICAR.
-                var sicarConnectionString = ResolveSicarConnectionString();
+                // Wizard base: host/puerto/user/password. SIN Database=.
+                var baseConnectionString = ResolveSicarBaseConnectionString();
+
+                // Listamos las DBs disponibles para reportar al backend.
+                // Si falla, seguimos igual — el admin puede escribir el nombre a mano.
+                var detectedDatabases = await ListDatabasesSafelyAsync(baseConnectionString, stoppingToken);
+                if (detectedDatabases.Count > 0)
+                {
+                    _logger.LogInformation(
+                        "Bases de datos SICAR detectadas: {Dbs}",
+                        string.Join(", ", detectedDatabases));
+                }
 
                 var backendUrl = _config["Backend:Url"]
                     ?? throw new InvalidOperationException("Falta configuración Backend:Url");
@@ -86,26 +104,26 @@ public class RegistrationService : BackgroundService
 
                 _logger.LogInformation("Registrando agente contra {BackendUrl} como {Name}", backendUrl, name);
 
-                var response = await _client.RegisterAsync(linkToken, name, version, hostInfo, stoppingToken);
+                var response = await _client.RegisterAsync(
+                    linkToken, name, version, hostInfo, detectedDatabases, stoppingToken);
 
                 var cfg = new AgentConfig
                 {
                     AgentId = response.AgentId,
                     Token = response.Token,
                     BackendUrl = backendUrl,
-                    BranchId = response.BranchId,
                     OrganizationId = response.OrganizationId,
                     RegisteredAt = DateTime.UtcNow,
-                    SicarConnectionString = sicarConnectionString,
+                    SicarBaseConnectionString = baseConnectionString,
                 };
 
                 await _storage.SaveAsync(cfg, stoppingToken);
                 _session.SetConfig(cfg);
 
                 _logger.LogInformation(
-                    "Registro exitoso: agentId={AgentId}, branchId={BranchId}",
+                    "Registro exitoso: agentId={AgentId}, orgId={OrgId}",
                     cfg.AgentId,
-                    cfg.BranchId);
+                    cfg.OrganizationId);
                 return;
             }
             catch (OperationCanceledException)
@@ -138,55 +156,85 @@ public class RegistrationService : BackgroundService
     }
 
     /// <summary>
-    /// Resuelve la connection string a la DB SICAR local. Orden de prioridad:
-    /// 1. Variable de entorno STOCKANDRIA_SICAR_CONNECTION_STRING (entera).
-    /// 2. Sección Sicar:ConnectionString en appsettings/appsettings.Development.json.
-    /// 3. Wizard interactivo por consola (pide host/port/user/password/db).
+    /// Resuelve la connection string BASE al servidor MySQL (sin Database=).
+    /// Orden de prioridad:
+    /// 1. Variable STOCKANDRIA_SICAR_BASE_CONNECTION_STRING.
+    /// 2. Clave Sicar:BaseConnectionString en appsettings.
+    /// 3. Wizard interactivo (host/puerto/user/password).
     /// </summary>
-    private string ResolveSicarConnectionString()
+    private string ResolveSicarBaseConnectionString()
     {
-        var fromEnv = Environment.GetEnvironmentVariable("STOCKANDRIA_SICAR_CONNECTION_STRING");
+        var fromEnv = Environment.GetEnvironmentVariable("STOCKANDRIA_SICAR_BASE_CONNECTION_STRING");
         if (!string.IsNullOrWhiteSpace(fromEnv))
         {
-            _logger.LogInformation("SicarConnectionString leída desde STOCKANDRIA_SICAR_CONNECTION_STRING.");
+            _logger.LogInformation("SicarBaseConnectionString leída desde STOCKANDRIA_SICAR_BASE_CONNECTION_STRING.");
             return fromEnv.Trim();
         }
 
-        var fromConfig = _config["Sicar:ConnectionString"];
+        var fromConfig = _config["Sicar:BaseConnectionString"];
         if (!string.IsNullOrWhiteSpace(fromConfig))
         {
-            _logger.LogInformation("SicarConnectionString leída desde config Sicar:ConnectionString.");
+            _logger.LogInformation("SicarBaseConnectionString leída desde config Sicar:BaseConnectionString.");
             return fromConfig.Trim();
         }
 
-        return RunSicarWizard();
+        return RunWizard();
     }
 
-    private string RunSicarWizard()
+    private string RunWizard()
     {
-        _logger.LogInformation("Lanzando wizard interactivo de configuración SICAR.");
+        _logger.LogInformation("Lanzando wizard interactivo del servidor MySQL local.");
 
         Console.WriteLine();
         Console.WriteLine("=========================================================");
-        Console.WriteLine(" Configuración de la base de datos SICAR local");
+        Console.WriteLine(" Conexión al servidor MySQL local (SICAR)");
         Console.WriteLine("=========================================================");
-        Console.WriteLine(" Ingresá los datos de la DB MariaDB/MySQL de SICAR.");
-        Console.WriteLine(" (Podés escapar esto seteando STOCKANDRIA_SICAR_CONNECTION_STRING");
-        Console.WriteLine("  o Sicar:ConnectionString en appsettings.)");
+        Console.WriteLine(" Estos datos son del SERVIDOR MySQL — no de una DB específica.");
+        Console.WriteLine(" El agente va a poder conectarse a cualquier base de datos SICAR");
+        Console.WriteLine(" que esté en ese servidor. En Stockandria mapeás cada sucursal");
+        Console.WriteLine(" con el nombre de su DB correspondiente.");
         Console.WriteLine();
 
         var host = Prompt("Host", "localhost");
         var port = Prompt("Puerto", "3306");
-        var database = Prompt("Base de datos", "sicar");
         var user = Prompt("Usuario", "root");
         var password = PromptSecret("Password");
 
-        var cs = $"Server={host};Port={port};Database={database};Uid={user};Pwd={password};" +
+        var cs = $"Server={host};Port={port};Uid={user};Pwd={password};" +
                  "AllowUserVariables=true;Pooling=true;";
         Console.WriteLine();
-        Console.WriteLine("Connection string armada (password oculta). Guardando cifrada...");
+        Console.WriteLine("Conexión base armada. Guardando cifrada...");
         Console.WriteLine();
         return cs;
+    }
+
+    private async Task<List<string>> ListDatabasesSafelyAsync(
+        string baseConnectionString,
+        CancellationToken ct)
+    {
+        try
+        {
+            await using var conn = new MySqlConnection(baseConnectionString);
+            await conn.OpenAsync(ct);
+            await using var cmd = new MySqlCommand("SHOW DATABASES", conn);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+            var databases = new List<string>();
+            while (await reader.ReadAsync(ct))
+            {
+                var name = reader.GetString(0);
+                if (!SystemDatabases.Contains(name))
+                {
+                    databases.Add(name);
+                }
+            }
+            return databases;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "No se pudieron listar las DBs al registrar (continuamos sin la lista)");
+            return new List<string>();
+        }
     }
 
     private static string Prompt(string label, string? defaultValue = null)
@@ -208,7 +256,6 @@ public class RegistrationService : BackgroundService
             Console.Write($"{label}: ");
             var sb = new System.Text.StringBuilder();
 
-            // Si no hay TTY interactivo, caemos a ReadLine normal.
             if (Console.IsInputRedirected)
             {
                 var line = Console.ReadLine() ?? string.Empty;

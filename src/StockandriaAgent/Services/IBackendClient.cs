@@ -9,6 +9,7 @@ public interface IBackendClient
         string name,
         string? version,
         object? hostInfo,
+        IReadOnlyList<string>? detectedDatabases,
         CancellationToken ct);
 
     Task SendHeartbeatAsync(HeartbeatPayload payload, CancellationToken ct);

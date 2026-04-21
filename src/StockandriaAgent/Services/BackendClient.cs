@@ -36,6 +36,7 @@ public class BackendClient : IBackendClient
         string name,
         string? version,
         object? hostInfo,
+        IReadOnlyList<string>? detectedDatabases,
         CancellationToken ct)
     {
         using var client = _factory.CreateClient(HttpClientName);
@@ -45,6 +46,7 @@ public class BackendClient : IBackendClient
             name,
             version,
             hostInfo,
+            detectedDatabases,
         };
 
         using var response = await client.PostAsJsonAsync("/agent/register", body, JsonOptions, ct);
