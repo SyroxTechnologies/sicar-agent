@@ -38,6 +38,7 @@ public class CommandDispatcher
                 "UPDATE_MIN_MAX" => CommandResult.Ok(await _sicar.UpdateMinMaxAsync(payload, ct)),
                 "TRANSFER_STOCK" => CommandResult.Ok(await _sicar.TransferStockAsync(payload, ct)),
                 "UPDATE_SUPPLIER" => CommandResult.Ok(await _sicar.UpdateSupplierAsync(payload, ct)),
+                "UPDATE_PRODUCT" => CommandResult.Ok(await _sicar.UpdateProductAsync(payload, ct)),
 
                 "GET_PRODUCTS" => CommandResult.Ok(await _sicar.GetProductsAsync(payload, ct)),
                 "GET_STOCK" => CommandResult.Ok(await _sicar.GetStockAsync(payload, ct)),

@@ -34,6 +34,8 @@ public class BackendClient : IBackendClient
     public async Task<RegisterResponse> RegisterAsync(
         string linkToken,
         string name,
+        string installationId,
+        string databaseName,
         string? version,
         object? hostInfo,
         IReadOnlyList<string>? detectedDatabases,
@@ -44,6 +46,8 @@ public class BackendClient : IBackendClient
         {
             linkToken,
             name,
+            installationId,
+            databaseName,
             version,
             hostInfo,
             detectedDatabases,
@@ -58,6 +62,14 @@ public class BackendClient : IBackendClient
             throw new InvalidOperationException("Respuesta vacía al registrar el agente");
         }
         return envelope.Data;
+    }
+
+    public async Task LinkBranchAsync(string linkToken, string databaseName, CancellationToken ct)
+    {
+        using var client = await CreateAuthenticatedClientAsync(ct);
+        var body = new { linkToken, databaseName };
+        using var response = await client.PostAsJsonAsync("/agent/link-branch", body, JsonOptions, ct);
+        await EnsureSuccessAsync(response, "link-branch", ct);
     }
 
     public async Task SendHeartbeatAsync(HeartbeatPayload payload, CancellationToken ct)

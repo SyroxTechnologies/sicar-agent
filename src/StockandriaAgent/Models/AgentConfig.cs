@@ -15,4 +15,11 @@ public class AgentConfig
     /// comando. Se persiste cifrada con DPAPI (Windows) o plaintext 0600 (Linux dev).
     /// </summary>
     public string SicarBaseConnectionString { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Último link token que se consumió exitosamente (en register o link-branch).
+    /// Se usa para evitar reintentar el mismo token en cada arranque cuando el
+    /// usuario lo deja seteado en env/appsettings.
+    /// </summary>
+    public string? LastConsumedLinkToken { get; set; }
 }

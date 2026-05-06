@@ -121,16 +121,24 @@ public class SicarAdapter : ISicarAdapter
         await using var conn = await OpenAsync(db, ct);
         var products = new List<Dictionary<string, object?>>();
 
+        // Nota: la tabla `impuesto` viene vacía en los SICAR de prueba y la
+        // columna del porcentaje varía según versión (`porcentaje`, `tasa`,
+        // etc.). Devolvemos NULL para que el back aplique fallback 16%.
         const string sql = @"
-            SELECT a.art_id, a.clave, a.descripcion, a.precio1, a.precio2, a.precio3, a.precio4,
-                   a.precioCompra, a.existencia, a.invMin, a.invMax, a.cat_id, a.status,
+            SELECT a.art_id, a.clave, a.claveAlterna, a.descripcion,
+                   a.precio1, a.precio2, a.precio3, a.precio4,
+                   a.precioCompra, a.existencia, a.invMin, a.invMax,
+                   a.cat_id, a.status,
                    c.nombre AS categoria_nombre,
+                   u.nombre AS unidad_nombre,
+                   NULL AS iva_porcentaje,
                    (SELECT pa.pro_id
                     FROM proveedorarticulo pa
                     WHERE pa.art_id = a.art_id
                     LIMIT 1) AS proveedor_pro_id
             FROM articulo a
-            LEFT JOIN categoria c ON c.cat_id = a.cat_id";
+            LEFT JOIN categoria c ON c.cat_id = a.cat_id
+            LEFT JOIN unidad u ON u.uni_id = a.unidadVenta";
 
         await using var cmd = new MySqlCommand(sql, conn);
         await using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -172,9 +180,18 @@ public class SicarAdapter : ISicarAdapter
         const string sql = @"
             SELECT pro_id,
                    nombre,
+                   representante,
                    alias,
                    rfc,
                    domicilio AS direccion,
+                   noExt,
+                   noInt,
+                   colonia,
+                   localidad,
+                   ciudad,
+                   estado,
+                   pais,
+                   codigoPostal,
                    telefono,
                    mail AS correo,
                    diasCredito,
@@ -385,6 +402,44 @@ public class SicarAdapter : ISicarAdapter
         return new { direction, results };
     }
 
+    public async Task<object> UpdateProductAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+        var artId = payload.GetProperty("artId").GetInt32();
+        var fields = payload.GetProperty("fields");
+
+        // Whitelist: solo permitimos modificar campos comunes con Stockandria
+        // (descripcion=name, claveAlterna=barcode, status=isActive). Los
+        // precios/stock/min-max tienen sus propios comandos (UPDATE_PRICE,
+        // ADJUST_STOCK, UPDATE_MIN_MAX) — no van por acá.
+        var allowed = new[] { "descripcion", "claveAlterna", "status" };
+        var sets = new List<string>();
+        var cmd = new MySqlCommand();
+
+        foreach (var field in allowed)
+        {
+            if (fields.TryGetProperty(field, out var val) && val.ValueKind != JsonValueKind.Null)
+            {
+                sets.Add($"{field} = @{field}");
+                cmd.Parameters.AddWithValue($"@{field}", ToSqlValue(val));
+            }
+        }
+
+        if (sets.Count == 0)
+        {
+            throw new InvalidOperationException("No se envió ningún campo para actualizar");
+        }
+
+        await using var conn = await OpenAsync(db, ct);
+        cmd.Connection = conn;
+        cmd.CommandText = $"UPDATE articulo SET {string.Join(", ", sets)} WHERE art_id = @id";
+        cmd.Parameters.AddWithValue("@id", artId);
+
+        var rows = await cmd.ExecuteNonQueryAsync(ct);
+        _logger.LogInformation("UPDATE_PRODUCT db={Db} art_id={ArtId} rows={Rows}", db, artId, rows);
+        return new { artId, rowsAffected = rows };
+    }
+
     public async Task<object> UpdateSupplierAsync(JsonElement payload, CancellationToken ct)
     {
         var db = RequireDatabaseName(payload);
@@ -433,14 +488,25 @@ public class SicarAdapter : ISicarAdapter
             var artId = payload.GetProperty("artId").GetInt32();
             await using var conn = await OpenAsync(db, ct);
 
+            // Mismas columnas que SyncProductsAsync para que el back pueda
+            // reusar ProductSyncerService.applySingle() en el flujo refresh.
             const string sql = @"
-                SELECT a.art_id, a.clave, a.descripcion, a.precioCompra, a.precio1, a.precio2,
-                       a.precio3, a.precio4, a.existencia, a.invMin, a.invMax, a.cat_id,
-                       a.localizacion, a.status, a.claveAlterna, a.preCompraProm,
+                SELECT a.art_id, a.clave, a.claveAlterna, a.descripcion,
+                       a.precio1, a.precio2, a.precio3, a.precio4,
+                       a.precioCompra, a.existencia, a.invMin, a.invMax,
+                       a.cat_id, a.status,
+                       a.localizacion, a.preCompraProm,
                        c.nombre AS categoria_nombre,
-                       d.dep_id, d.nombre AS departamento_nombre
+                       u.nombre AS unidad_nombre,
+                       d.dep_id, d.nombre AS departamento_nombre,
+                       NULL AS iva_porcentaje,
+                       (SELECT pa.pro_id
+                        FROM proveedorarticulo pa
+                        WHERE pa.art_id = a.art_id
+                        LIMIT 1) AS proveedor_pro_id
                 FROM articulo a
                 LEFT JOIN categoria c ON c.cat_id = a.cat_id
+                LEFT JOIN unidad u ON u.uni_id = a.unidadVenta
                 LEFT JOIN departamento d ON d.dep_id = c.dep_id
                 WHERE a.art_id = @id";
 
@@ -690,10 +756,16 @@ public class SicarAdapter : ISicarAdapter
             var proId = payload.GetProperty("proId").GetInt32();
             await using var conn = await OpenAsync(db, ct);
 
+            // Aliases consistentes con SyncSuppliersAsync para que el back
+            // pueda reusar SupplierSyncerService.applySingle() con esta fila
+            // sin transformación intermedia.
             const string sql = @"
-                SELECT pro_id, nombre, alias, representante, domicilio, noExt, noInt,
-                       localidad, ciudad, estado, pais, codigoPostal, colonia, rfc,
-                       curp, telefono, celular, mail, comentario, status, limite, diasCredito
+                SELECT pro_id, nombre, representante, alias, rfc,
+                       domicilio AS direccion, noExt, noInt, colonia,
+                       localidad, ciudad, estado, pais, codigoPostal,
+                       telefono, mail AS correo,
+                       diasCredito, status,
+                       curp, celular, comentario, limite
                 FROM proveedor
                 WHERE pro_id = @id";
 

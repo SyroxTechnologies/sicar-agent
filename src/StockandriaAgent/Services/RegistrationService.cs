@@ -1,3 +1,4 @@
+using System.Net;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using Microsoft.Extensions.Configuration;
@@ -62,6 +63,10 @@ public class RegistrationService : BackgroundService
             }
 
             _session.SetConfig(existing);
+
+            // Si hay un link token nuevo (que no fue consumido aún), lo usamos
+            // para vincular UNA SUCURSAL ADICIONAL a este agente ya instalado.
+            await TryLinkAdditionalBranchAsync(existing, stoppingToken);
             return;
         }
 
@@ -96,16 +101,32 @@ public class RegistrationService : BackgroundService
                         string.Join(", ", detectedDatabases));
                 }
 
+                // Nombre de la DB SICAR específica para la sucursal del linkToken.
+                var databaseName = ResolveDatabaseName(detectedDatabases);
+
                 var backendUrl = _config["Backend:Url"]
                     ?? throw new InvalidOperationException("Falta configuración Backend:Url");
                 var name = Environment.MachineName;
                 var version = GetAgentVersion();
                 var hostInfo = BuildHostInfo(version);
+                var installationId = InstallationIdProvider.Get(_logger);
 
-                _logger.LogInformation("Registrando agente contra {BackendUrl} como {Name}", backendUrl, name);
+                _logger.LogInformation(
+                    "Registrando agente contra {BackendUrl} como {Name} (installationId={InstallationId}, db={DatabaseName})",
+                    backendUrl,
+                    name,
+                    installationId,
+                    databaseName);
 
                 var response = await _client.RegisterAsync(
-                    linkToken, name, version, hostInfo, detectedDatabases, stoppingToken);
+                    linkToken,
+                    name,
+                    installationId,
+                    databaseName,
+                    version,
+                    hostInfo,
+                    detectedDatabases,
+                    stoppingToken);
 
                 var cfg = new AgentConfig
                 {
@@ -115,6 +136,7 @@ public class RegistrationService : BackgroundService
                     OrganizationId = response.OrganizationId,
                     RegisteredAt = DateTime.UtcNow,
                     SicarBaseConnectionString = baseConnectionString,
+                    LastConsumedLinkToken = linkToken,
                 };
 
                 await _storage.SaveAsync(cfg, stoppingToken);
@@ -135,6 +157,64 @@ public class RegistrationService : BackgroundService
                 _logger.LogError(ex, "Error durante el registro. Reintentando en {Delay}s.", RetryDelay.TotalSeconds);
                 await Task.Delay(RetryDelay, stoppingToken);
             }
+        }
+    }
+
+    /// <summary>
+    /// Si hay un link token disponible y todavía no fue consumido por esta
+    /// instalación, lo usamos para vincular una sucursal nueva a este agente.
+    /// El servidor MySQL ya está configurado, así que solo necesitamos saber
+    /// el nombre de la base de datos SICAR de la sucursal.
+    /// </summary>
+    private async Task TryLinkAdditionalBranchAsync(AgentConfig config, CancellationToken ct)
+    {
+        var linkToken = ReadLinkToken();
+        if (string.IsNullOrWhiteSpace(linkToken))
+        {
+            return;
+        }
+
+        if (linkToken == config.LastConsumedLinkToken)
+        {
+            _logger.LogDebug("El link token configurado ya fue consumido previamente. Ignoro.");
+            return;
+        }
+
+        try
+        {
+            var detectedDatabases = await ListDatabasesSafelyAsync(config.SicarBaseConnectionString, ct);
+            var databaseName = ResolveDatabaseName(detectedDatabases);
+
+            _logger.LogInformation(
+                "Vinculando sucursal nueva con base {DatabaseName} usando link token...",
+                databaseName);
+
+            await _client.LinkBranchAsync(linkToken, databaseName, ct);
+
+            config.LastConsumedLinkToken = linkToken;
+            await _storage.SaveAsync(config, ct);
+
+            _logger.LogInformation("Sucursal vinculada exitosamente al agente {AgentId}.", config.AgentId);
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.BadRequest)
+        {
+            // Token ya usado, expirado, o de otra org: no es un error de
+            // ejecución, solo lo marcamos como consumido para no reintentar.
+            _logger.LogInformation(
+                "El backend rechazó el link token ({Reason}). Lo marco como consumido para no reintentar.",
+                ex.Message);
+            config.LastConsumedLinkToken = linkToken;
+            await _storage.SaveAsync(config, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Error vinculando sucursal nueva con link token. El agente sigue funcionando con sus sucursales actuales.");
         }
     }
 
@@ -179,6 +259,46 @@ public class RegistrationService : BackgroundService
         }
 
         return RunWizard();
+    }
+
+    /// <summary>
+    /// Resuelve el nombre de la base de datos SICAR de la sucursal a vincular.
+    /// Orden de prioridad:
+    /// 1. Variable STOCKANDRIA_SICAR_DATABASE_NAME.
+    /// 2. Clave Sicar:DatabaseName en appsettings.
+    /// 3. Wizard interactivo, listando las DBs detectadas si las hay.
+    /// </summary>
+    private string ResolveDatabaseName(IReadOnlyList<string> detectedDatabases)
+    {
+        var fromEnv = Environment.GetEnvironmentVariable("STOCKANDRIA_SICAR_DATABASE_NAME");
+        if (!string.IsNullOrWhiteSpace(fromEnv))
+        {
+            _logger.LogInformation("Nombre de DB SICAR leído desde STOCKANDRIA_SICAR_DATABASE_NAME.");
+            return fromEnv.Trim();
+        }
+
+        var fromConfig = _config["Sicar:DatabaseName"];
+        if (!string.IsNullOrWhiteSpace(fromConfig))
+        {
+            _logger.LogInformation("Nombre de DB SICAR leído desde config Sicar:DatabaseName.");
+            return fromConfig.Trim();
+        }
+
+        Console.WriteLine();
+        Console.WriteLine("=========================================================");
+        Console.WriteLine(" Base de datos SICAR para esta sucursal");
+        Console.WriteLine("=========================================================");
+        if (detectedDatabases.Count > 0)
+        {
+            Console.WriteLine(" Bases de datos detectadas en este servidor:");
+            foreach (var db in detectedDatabases)
+            {
+                Console.WriteLine($"   - {db}");
+            }
+            Console.WriteLine();
+        }
+
+        return Prompt("Nombre de la base de datos SICAR");
     }
 
     private string RunWizard()
@@ -232,7 +352,7 @@ public class RegistrationService : BackgroundService
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "No se pudieron listar las DBs al registrar (continuamos sin la lista)");
+            _logger.LogWarning(ex, "No se pudieron listar las DBs (continuamos sin la lista)");
             return new List<string>();
         }
     }

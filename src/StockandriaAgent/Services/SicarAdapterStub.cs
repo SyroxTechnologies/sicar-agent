@@ -77,6 +77,9 @@ public class SicarAdapterStub : ISicarAdapter
     public Task<object> UpdateSupplierAsync(JsonElement payload, CancellationToken ct) =>
         Task.FromResult<object>(new { ok = true, stub = true });
 
+    public Task<object> UpdateProductAsync(JsonElement payload, CancellationToken ct) =>
+        Task.FromResult<object>(new { ok = true, stub = true });
+
     public Task<object> GetProductsAsync(JsonElement payload, CancellationToken ct)
     {
         object response = new { items = Array.Empty<object>(), total = 0, page = 1, limit = 50, stub = true };
