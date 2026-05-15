@@ -23,6 +23,16 @@ public static class InstallationIdProvider
 {
     public static string Get(ILogger? logger = null)
     {
+        // Override por env var. Necesario en Docker: dos réplicas del agente
+        // sobre la misma imagen comparten el /etc/machine-id del filesystem
+        // base y colisionan en el upsert(organizationId, installationId) del
+        // backend. La env var permite asignar un ID estable y único por contenedor.
+        var fromEnv = Environment.GetEnvironmentVariable("STOCKANDRIA_INSTALLATION_ID");
+        if (!string.IsNullOrWhiteSpace(fromEnv))
+        {
+            return fromEnv.Trim();
+        }
+
         try
         {
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
