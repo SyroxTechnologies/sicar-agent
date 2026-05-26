@@ -103,4 +103,10 @@ public class SicarAdapterStub : ISicarAdapter
         object response = new { items = Array.Empty<object>(), total = 0, page = 1, limit = 50, stub = true };
         return Task.FromResult(response);
     }
+
+    public Task<object> GetProductMarginsAsync(JsonElement payload, CancellationToken ct)
+    {
+        object response = Array.Empty<object>();
+        return Task.FromResult(response);
+    }
 }

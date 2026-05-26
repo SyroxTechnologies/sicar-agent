@@ -834,6 +834,35 @@ public class SicarAdapter : ISicarAdapter
         return new { items, total, page, limit };
     }
 
+    public async Task<object> GetProductMarginsAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+        await using var conn = await OpenAsync(db, ct);
+
+        const string sql = @"
+            SELECT cat_id, margen1, margen2, margen3, margen4
+            FROM articulo
+            WHERE status = 1 AND cat_id IS NOT NULL";
+
+        await using var cmd = new MySqlCommand(sql, conn);
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+        var rows = new List<object>();
+        while (await reader.ReadAsync(ct))
+        {
+            rows.Add(new
+            {
+                catId = reader.GetInt32(reader.GetOrdinal("cat_id")),
+                margen1 = reader.IsDBNull(reader.GetOrdinal("margen1")) ? 0m : reader.GetDecimal(reader.GetOrdinal("margen1")),
+                margen2 = reader.IsDBNull(reader.GetOrdinal("margen2")) ? 0m : reader.GetDecimal(reader.GetOrdinal("margen2")),
+                margen3 = reader.IsDBNull(reader.GetOrdinal("margen3")) ? 0m : reader.GetDecimal(reader.GetOrdinal("margen3")),
+                margen4 = reader.IsDBNull(reader.GetOrdinal("margen4")) ? 0m : reader.GetDecimal(reader.GetOrdinal("margen4")),
+            });
+        }
+
+        return rows;
+    }
+
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------

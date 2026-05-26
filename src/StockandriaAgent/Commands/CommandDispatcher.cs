@@ -44,6 +44,7 @@ public class CommandDispatcher
                 "GET_STOCK" => CommandResult.Ok(await _sicar.GetStockAsync(payload, ct)),
                 "GET_TRANSFERS" => CommandResult.Ok(await _sicar.GetTransfersAsync(payload, ct)),
                 "GET_SUPPLIERS" => CommandResult.Ok(await _sicar.GetSuppliersAsync(payload, ct)),
+                "GET_PRODUCT_MARGINS" => CommandResult.Ok(await _sicar.GetProductMarginsAsync(payload, ct)),
 
                 _ => UnknownCommand(command.Type),
             };

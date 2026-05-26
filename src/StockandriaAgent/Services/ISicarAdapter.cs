@@ -43,4 +43,5 @@ public interface ISicarAdapter
     Task<object> GetStockAsync(JsonElement payload, CancellationToken ct);
     Task<object> GetTransfersAsync(JsonElement payload, CancellationToken ct);
     Task<object> GetSuppliersAsync(JsonElement payload, CancellationToken ct);
+    Task<object> GetProductMarginsAsync(JsonElement payload, CancellationToken ct);
 }
