@@ -80,6 +80,11 @@ public class SicarAdapterStub : ISicarAdapter
     public Task<object> UpdateProductAsync(JsonElement payload, CancellationToken ct) =>
         Task.FromResult<object>(new { ok = true, stub = true });
 
+    public Task<object> InsertProductAsync(JsonElement payload, CancellationToken ct) =>
+        // Stub: simulamos un art_id ficticio para que el flujo end-to-end
+        // de dev funcione sin SICAR real corriendo.
+        Task.FromResult<object>(new { artId = 999999, clave = payload.TryGetProperty("clave", out var c) ? c.GetString() : "STUB", stub = true });
+
     public Task<object> GetProductsAsync(JsonElement payload, CancellationToken ct)
     {
         object response = new { items = Array.Empty<object>(), total = 0, page = 1, limit = 50, stub = true };
@@ -109,4 +114,25 @@ public class SicarAdapterStub : ISicarAdapter
         object response = Array.Empty<object>();
         return Task.FromResult(response);
     }
+
+    public Task<object> GetCategoriesAsync(JsonElement payload, CancellationToken ct)
+    {
+        object response = Array.Empty<object>();
+        return Task.FromResult(response);
+    }
+
+    public Task<object> GetSupplierCategoriesAsync(JsonElement payload, CancellationToken ct)
+        => Task.FromResult<object>(new { rows = Array.Empty<object>() });
+
+    public Task<object> CreateDepartmentAsync(JsonElement payload, CancellationToken ct)
+        => Task.FromResult<object>(new { depId = 888888, stub = true });
+
+    public Task<object> UpdateDepartmentAsync(JsonElement payload, CancellationToken ct)
+        => Task.FromResult<object>(new { depId = payload.TryGetProperty("depId", out var d) ? d.GetInt32() : 0, rowsAffected = 1, stub = true });
+
+    public Task<object> CreateCategoryAsync(JsonElement payload, CancellationToken ct)
+        => Task.FromResult<object>(new { catId = 777777, stub = true });
+
+    public Task<object> UpdateCategoryAsync(JsonElement payload, CancellationToken ct)
+        => Task.FromResult<object>(new { catId = payload.TryGetProperty("catId", out var c) ? c.GetInt32() : 0, rowsAffected = 1, stub = true });
 }

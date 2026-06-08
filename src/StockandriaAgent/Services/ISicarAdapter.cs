@@ -39,9 +39,44 @@ public interface ISicarAdapter
     Task<object> UpdateSupplierAsync(JsonElement payload, CancellationToken ct);
     Task<object> UpdateProductAsync(JsonElement payload, CancellationToken ct);
 
+    /// <summary>
+    /// Inserta un producto nuevo en SICAR. Excepción autorizada a la regla
+    /// "solo SELECT y UPDATE": cuando un usuario crea un producto desde
+    /// Stockandria (típicamente desde el modal de regalo en una recepción
+    /// con un artículo no registrado en ese proveedor), Stockandria es la
+    /// fuente de verdad y necesita propagar el alta a SICAR para mantener
+    /// las bases sincronizadas.
+    /// </summary>
+    Task<object> InsertProductAsync(JsonElement payload, CancellationToken ct);
+
     Task<object> GetProductsAsync(JsonElement payload, CancellationToken ct);
     Task<object> GetStockAsync(JsonElement payload, CancellationToken ct);
     Task<object> GetTransfersAsync(JsonElement payload, CancellationToken ct);
     Task<object> GetSuppliersAsync(JsonElement payload, CancellationToken ct);
     Task<object> GetProductMarginsAsync(JsonElement payload, CancellationToken ct);
+
+    /// <summary>
+    /// Devuelve las categorias de SICAR con su departamento padre (JOIN
+    /// categoria -> departamento). Usado por la carga inicial de departamentos
+    /// en Stockandria: cada categoria local se matchea por nombre con esta
+    /// lista para descubrir a que departamento pertenece.
+    /// </summary>
+    Task<object> GetCategoriesAsync(JsonElement payload, CancellationToken ct);
+
+    /// <summary>
+    /// Devuelve el mapeo proveedor -> departamento -> categoría inferido desde
+    /// los artículos del proveedor (JOIN proveedorarticulo). Con `proId` en el
+    /// payload filtra ese proveedor; sin él trae el mapeo completo. Usado por la
+    /// sincronización viva: al sincronizar un proveedor se traen sus
+    /// departamentos y categorías.
+    /// </summary>
+    Task<object> GetSupplierCategoriesAsync(JsonElement payload, CancellationToken ct);
+
+    // Escritura de catalogo (jerarquia departamento -> categoria). Los CREATE
+    // devuelven el id generado por SICAR (dep_id / cat_id) para que Stockandria
+    // lo guarde como sicarCode.
+    Task<object> CreateDepartmentAsync(JsonElement payload, CancellationToken ct);
+    Task<object> UpdateDepartmentAsync(JsonElement payload, CancellationToken ct);
+    Task<object> CreateCategoryAsync(JsonElement payload, CancellationToken ct);
+    Task<object> UpdateCategoryAsync(JsonElement payload, CancellationToken ct);
 }

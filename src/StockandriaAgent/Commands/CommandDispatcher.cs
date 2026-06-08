@@ -39,12 +39,20 @@ public class CommandDispatcher
                 "TRANSFER_STOCK" => CommandResult.Ok(await _sicar.TransferStockAsync(payload, ct)),
                 "UPDATE_SUPPLIER" => CommandResult.Ok(await _sicar.UpdateSupplierAsync(payload, ct)),
                 "UPDATE_PRODUCT" => CommandResult.Ok(await _sicar.UpdateProductAsync(payload, ct)),
+                "INSERT_PRODUCT" => CommandResult.Ok(await _sicar.InsertProductAsync(payload, ct)),
 
                 "GET_PRODUCTS" => CommandResult.Ok(await _sicar.GetProductsAsync(payload, ct)),
                 "GET_STOCK" => CommandResult.Ok(await _sicar.GetStockAsync(payload, ct)),
                 "GET_TRANSFERS" => CommandResult.Ok(await _sicar.GetTransfersAsync(payload, ct)),
                 "GET_SUPPLIERS" => CommandResult.Ok(await _sicar.GetSuppliersAsync(payload, ct)),
                 "GET_PRODUCT_MARGINS" => CommandResult.Ok(await _sicar.GetProductMarginsAsync(payload, ct)),
+                "GET_CATEGORIES" => CommandResult.Ok(await _sicar.GetCategoriesAsync(payload, ct)),
+                "GET_SUPPLIER_CATEGORIES" => CommandResult.Ok(await _sicar.GetSupplierCategoriesAsync(payload, ct)),
+
+                "CREATE_DEPARTMENT" => CommandResult.Ok(await _sicar.CreateDepartmentAsync(payload, ct)),
+                "UPDATE_DEPARTMENT" => CommandResult.Ok(await _sicar.UpdateDepartmentAsync(payload, ct)),
+                "CREATE_CATEGORY" => CommandResult.Ok(await _sicar.CreateCategoryAsync(payload, ct)),
+                "UPDATE_CATEGORY" => CommandResult.Ok(await _sicar.UpdateCategoryAsync(payload, ct)),
 
                 _ => UnknownCommand(command.Type),
             };

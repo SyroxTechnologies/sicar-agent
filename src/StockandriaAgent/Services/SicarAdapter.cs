@@ -11,8 +11,10 @@ namespace StockandriaAgent.Services;
 /// Cada comando incluye en su payload un campo `databaseName` que el adapter
 /// usa para armar la connection string contra esa DB puntual.
 ///
-/// Regla estricta: solo SELECT y UPDATE. Nunca INSERT ni DELETE — la
-/// auditoría vive en Stockandria, no en SICAR.
+/// Regla: SELECT, UPDATE, y un único INSERT permitido
+/// (<see cref="InsertProductAsync"/>) para sincronizar productos creados
+/// desde Stockandria. Nunca DELETE — los borrados se manejan vía soft-delete
+/// en Stockandria, no se propagan.
 /// </summary>
 public class SicarAdapter : ISicarAdapter
 {
@@ -288,7 +290,7 @@ public class SicarAdapter : ISicarAdapter
         var sets = new List<string>();
         var cmd = new MySqlCommand();
 
-        foreach (var prop in new[] { "precio1", "precio2", "precio3", "precio4" })
+        foreach (var prop in new[] { "precio1", "precio2", "precio3", "precio4", "precioCompra" })
         {
             if (prices.TryGetProperty(prop, out var val) && val.ValueKind == JsonValueKind.Number)
             {
@@ -409,10 +411,10 @@ public class SicarAdapter : ISicarAdapter
         var fields = payload.GetProperty("fields");
 
         // Whitelist: solo permitimos modificar campos comunes con Stockandria
-        // (descripcion=name, claveAlterna=barcode, status=isActive). Los
-        // precios/stock/min-max tienen sus propios comandos (UPDATE_PRICE,
-        // ADJUST_STOCK, UPDATE_MIN_MAX) — no van por acá.
-        var allowed = new[] { "descripcion", "claveAlterna", "status" };
+        // (descripcion=name, clave=sku, claveAlterna=barcode, status=isActive).
+        // Los precios/stock/min-max tienen sus propios comandos (UPDATE_PRICE,
+        // ADJUST_STOCK, UPDATE_MIN_MAX) - no van por acá.
+        var allowed = new[] { "descripcion", "clave", "claveAlterna", "status" };
         var sets = new List<string>();
         var cmd = new MySqlCommand();
 
@@ -438,6 +440,159 @@ public class SicarAdapter : ISicarAdapter
         var rows = await cmd.ExecuteNonQueryAsync(ct);
         _logger.LogInformation("UPDATE_PRODUCT db={Db} art_id={ArtId} rows={Rows}", db, artId, rows);
         return new { artId, rowsAffected = rows };
+    }
+
+    /// <summary>
+    /// Inserta un producto nuevo en la tabla `articulo` y devuelve el
+    /// `art_id` generado por MySQL (LAST_INSERT_ID).
+    ///
+    /// Payload requerido:
+    ///   clave           (string, único)
+    ///   descripcion     (string, nombre del producto)
+    ///   precio          (decimal, precio de venta — se asigna a precio1)
+    ///   precioCompra    (decimal, costo)
+    ///   categoria       (string, nombre — el agente resuelve cat_id)
+    ///   unidad          (string, nombre — el agente resuelve unidadCompra
+    ///                    y unidadVenta; ambas terminan siendo la misma)
+    ///
+    /// Payload opcional:
+    ///   claveAlterna, invMin, invMax
+    ///
+    /// El agente resuelve cat_id y uni_id buscando por nombre. Si no
+    /// existe la categoría o unidad, falla con error claro: Stockandria
+    /// debe asegurar que estén sincronizadas antes de encolar.
+    ///
+    /// Si la `clave` ya existe se aborta con error claro (Stockandria valida
+    /// antes pero defendemos profundo). El art_id devuelto se guarda como
+    /// sicar_code en Stockandria para que después UPDATE_PRODUCT/PRICE/etc
+    /// puedan apuntar a él.
+    /// </summary>
+    public async Task<object> InsertProductAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+        var clave = payload.GetProperty("clave").GetString()
+            ?? throw new InvalidOperationException("payload.clave es requerido");
+        var descripcion = payload.GetProperty("descripcion").GetString()
+            ?? throw new InvalidOperationException("payload.descripcion es requerido");
+        var precio = payload.GetProperty("precio").GetDecimal();
+        var precioCompra = payload.TryGetProperty("precioCompra", out var pc)
+            && pc.ValueKind == JsonValueKind.Number
+                ? pc.GetDecimal()
+                : 0m;
+        var categoriaNombre = payload.GetProperty("categoria").GetString()
+            ?? throw new InvalidOperationException("payload.categoria es requerido");
+        var unidadNombre = payload.GetProperty("unidad").GetString()
+            ?? throw new InvalidOperationException("payload.unidad es requerido");
+
+        var claveAlterna = payload.TryGetProperty("claveAlterna", out var ca)
+            && ca.ValueKind == JsonValueKind.String
+                ? ca.GetString() ?? ""
+                : "";
+        var invMin = payload.TryGetProperty("invMin", out var mn)
+            && mn.ValueKind == JsonValueKind.Number
+                ? mn.GetInt32()
+                : 0;
+        var invMax = payload.TryGetProperty("invMax", out var mx)
+            && mx.ValueKind == JsonValueKind.Number
+                ? mx.GetInt32()
+                : 0;
+
+        await using var conn = await OpenAsync(db, ct);
+
+        // Resolver cat_id y uni_id por nombre. Si no existen, fallar con
+        // mensaje claro (Stockandria debe sincronizar antes).
+        int catId;
+        await using (var catCmd = new MySqlCommand(
+            "SELECT cat_id FROM categoria WHERE nombre = @nombre LIMIT 1", conn))
+        {
+            catCmd.Parameters.AddWithValue("@nombre", categoriaNombre);
+            var catResult = await catCmd.ExecuteScalarAsync(ct);
+            if (catResult == null || catResult == DBNull.Value)
+            {
+                throw new InvalidOperationException(
+                    $"La categoría \"{categoriaNombre}\" no existe en SICAR. " +
+                    "Sincronizá categorías desde Stockandria antes de crear el producto.");
+            }
+            catId = Convert.ToInt32(catResult);
+        }
+
+        int uniId;
+        await using (var uniCmd = new MySqlCommand(
+            "SELECT uni_id FROM unidad WHERE nombre = @nombre LIMIT 1", conn))
+        {
+            uniCmd.Parameters.AddWithValue("@nombre", unidadNombre);
+            var uniResult = await uniCmd.ExecuteScalarAsync(ct);
+            if (uniResult == null || uniResult == DBNull.Value)
+            {
+                throw new InvalidOperationException(
+                    $"La unidad \"{unidadNombre}\" no existe en SICAR. " +
+                    "Las unidades validas son las del catalogo (PZA, KG, LT, ML, PAQ, etc.).");
+            }
+            uniId = Convert.ToInt32(uniResult);
+        }
+
+        // Validar que la clave no exista (defensa profunda — Stockandria
+        // ya valida antes de encolar, pero un INSERT contra UNIQUE constraint
+        // tira un error feo de MySQL).
+        await using (var check = new MySqlCommand(
+            "SELECT art_id FROM articulo WHERE clave = @clave LIMIT 1", conn))
+        {
+            check.Parameters.AddWithValue("@clave", clave);
+            var existing = await check.ExecuteScalarAsync(ct);
+            if (existing != null)
+            {
+                throw new InvalidOperationException(
+                    $"Ya existe un artículo con clave \"{clave}\" en SICAR (art_id={existing}).");
+            }
+        }
+
+        // Defaults conservadores: el editor extendido de Stockandria luego
+        // ajusta margen/mayoreo via UPDATE_PRICE.
+        const string sql = @"
+            INSERT INTO articulo (
+                clave, claveAlterna, descripcion, servicio, localizacion,
+                invMin, invMax, factor, precioCompra, preCompraProm,
+                margen1, margen2, margen3, margen4,
+                precio1, precio2, precio3, precio4,
+                mayoreo1, mayoreo2, mayoreo3, mayoreo4,
+                existencia, caracteristicas, cuentaPredial,
+                status, unidadCompra, unidadVenta, cat_id
+            ) VALUES (
+                @clave, @claveAlterna, @descripcion, FALSE, '',
+                @invMin, @invMax, 1.000, @precioCompra, @precioCompra,
+                0.000000, 0.000000, 0.000000, 0.000000,
+                @precio, 0.000000, 0.000000, 0.000000,
+                0.000, 0.000, 0.000, 0.000,
+                0.0000, '', '',
+                1, @unidadCompra, @unidadVenta, @catId
+            );
+            SELECT LAST_INSERT_ID();";
+
+        await using var cmd = new MySqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@clave", clave);
+        cmd.Parameters.AddWithValue("@claveAlterna", claveAlterna);
+        cmd.Parameters.AddWithValue("@descripcion", descripcion);
+        cmd.Parameters.AddWithValue("@invMin", invMin);
+        cmd.Parameters.AddWithValue("@invMax", invMax);
+        cmd.Parameters.AddWithValue("@precioCompra", precioCompra);
+        cmd.Parameters.AddWithValue("@precio", precio);
+        // Unidad de compra y venta son la misma — la mayoría de los
+        // productos del rubro se compran y venden en la misma unidad.
+        cmd.Parameters.AddWithValue("@unidadCompra", uniId);
+        cmd.Parameters.AddWithValue("@unidadVenta", uniId);
+        cmd.Parameters.AddWithValue("@catId", catId);
+
+        var artIdObj = await cmd.ExecuteScalarAsync(ct);
+        if (artIdObj == null || artIdObj == DBNull.Value)
+        {
+            throw new InvalidOperationException(
+                "INSERT_PRODUCT: no se obtuvo art_id del INSERT (LAST_INSERT_ID devolvió null).");
+        }
+        var artId = Convert.ToInt32(artIdObj);
+
+        _logger.LogInformation(
+            "INSERT_PRODUCT db={Db} art_id={ArtId} clave={Clave}", db, artId, clave);
+        return new { artId, clave };
     }
 
     public async Task<object> UpdateSupplierAsync(JsonElement payload, CancellationToken ct)
@@ -861,6 +1016,245 @@ public class SicarAdapter : ISicarAdapter
         }
 
         return rows;
+    }
+
+    public async Task<object> GetCategoriesAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+        await using var conn = await OpenAsync(db, ct);
+
+        // JOIN categoria -> departamento: en SICAR la categoria pertenece a un
+        // departamento (cat.dep_id). El proveedor NO esta en este eje, asi que
+        // no se incluye: la carga inicial en Stockandria deriva el proveedor de
+        // la categoria local que matchea por nombre.
+        const string sql = @"
+            SELECT c.cat_id, c.nombre AS categoria, d.dep_id, d.nombre AS departamento
+            FROM categoria c
+            JOIN departamento d ON d.dep_id = c.dep_id
+            WHERE c.status = 1 AND d.status = 1
+            ORDER BY d.nombre ASC, c.nombre ASC";
+
+        await using var cmd = new MySqlCommand(sql, conn);
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+        var rows = new List<object>();
+        while (await reader.ReadAsync(ct))
+        {
+            rows.Add(new
+            {
+                catId = reader.GetInt32(reader.GetOrdinal("cat_id")),
+                categoria = reader.IsDBNull(reader.GetOrdinal("categoria")) ? "" : reader.GetString(reader.GetOrdinal("categoria")),
+                depId = reader.GetInt32(reader.GetOrdinal("dep_id")),
+                departamento = reader.IsDBNull(reader.GetOrdinal("departamento")) ? "" : reader.GetString(reader.GetOrdinal("departamento")),
+            });
+        }
+
+        return new { categories = rows };
+    }
+
+    public async Task<object> GetSupplierCategoriesAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+        await using var conn = await OpenAsync(db, ct);
+
+        // En SICAR el departamento/categoria NO cuelgan del proveedor: el vinculo
+        // es proveedor -> articulo (tabla puente proveedorarticulo) -> categoria
+        // -> departamento. Inferimos los departamentos/categorias de un proveedor
+        // a partir de los articulos que le compra. Si viene proId, filtra ese
+        // proveedor; si no, trae el mapeo completo (un solo round-trip para el
+        // sync masivo).
+        var hasProId = payload.TryGetProperty("proId", out var proIdEl)
+            && proIdEl.ValueKind == JsonValueKind.Number;
+
+        var sql = @"
+            SELECT DISTINCT pa.pro_id, d.dep_id, d.nombre AS departamento,
+                            c.cat_id, c.nombre AS categoria
+            FROM proveedorarticulo pa
+            JOIN articulo a ON a.art_id = pa.art_id
+            JOIN categoria c ON c.cat_id = a.cat_id
+            JOIN departamento d ON d.dep_id = c.dep_id
+            WHERE c.status = 1 AND d.status = 1";
+        if (hasProId)
+        {
+            sql += " AND pa.pro_id = @proId";
+        }
+        sql += " ORDER BY pa.pro_id ASC, d.nombre ASC, c.nombre ASC";
+
+        await using var cmd = new MySqlCommand(sql, conn);
+        if (hasProId)
+        {
+            cmd.Parameters.AddWithValue("@proId", proIdEl.GetInt32());
+        }
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+        var rows = new List<object>();
+        while (await reader.ReadAsync(ct))
+        {
+            rows.Add(new
+            {
+                proId = reader.GetInt32(reader.GetOrdinal("pro_id")),
+                depId = reader.GetInt32(reader.GetOrdinal("dep_id")),
+                departamento = reader.IsDBNull(reader.GetOrdinal("departamento")) ? "" : reader.GetString(reader.GetOrdinal("departamento")),
+                catId = reader.GetInt32(reader.GetOrdinal("cat_id")),
+                categoria = reader.IsDBNull(reader.GetOrdinal("categoria")) ? "" : reader.GetString(reader.GetOrdinal("categoria")),
+            });
+        }
+
+        return new { rows };
+    }
+
+    public async Task<object> CreateDepartmentAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+        var nombre = payload.GetProperty("nombre").GetString()
+            ?? throw new InvalidOperationException("payload.nombre es requerido");
+
+        await using var conn = await OpenAsync(db, ct);
+
+        // Stockandria garantiza nombre unico por proveedor, pero SICAR maneja
+        // departamentos globales: evitamos duplicar uno que ya exista.
+        await using (var check = new MySqlCommand(
+            "SELECT dep_id FROM departamento WHERE nombre = @nombre LIMIT 1", conn))
+        {
+            check.Parameters.AddWithValue("@nombre", nombre);
+            var existing = await check.ExecuteScalarAsync(ct);
+            if (existing != null && existing != DBNull.Value)
+            {
+                throw new InvalidOperationException(
+                    $"Ya existe un departamento con nombre \"{nombre}\" en SICAR (dep_id={existing}).");
+            }
+        }
+
+        const string sql = @"
+            INSERT INTO departamento (nombre, restringido, porcentaje, system, status)
+            VALUES (@nombre, FALSE, 0.00, FALSE, 1);
+            SELECT LAST_INSERT_ID();";
+
+        await using var cmd = new MySqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@nombre", nombre);
+        var depIdObj = await cmd.ExecuteScalarAsync(ct);
+        if (depIdObj == null || depIdObj == DBNull.Value)
+        {
+            throw new InvalidOperationException(
+                "CREATE_DEPARTMENT: no se obtuvo dep_id (LAST_INSERT_ID devolvió null).");
+        }
+        var depId = Convert.ToInt32(depIdObj);
+
+        _logger.LogInformation(
+            "CREATE_DEPARTMENT db={Db} dep_id={DepId} nombre={Nombre}", db, depId, nombre);
+        return new { depId, nombre };
+    }
+
+    public async Task<object> UpdateDepartmentAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+        var depId = payload.GetProperty("depId").GetInt32();
+        var fields = payload.GetProperty("fields");
+
+        var allowed = new[] { "nombre" };
+        var sets = new List<string>();
+        var cmd = new MySqlCommand();
+
+        foreach (var field in allowed)
+        {
+            if (fields.TryGetProperty(field, out var val) && val.ValueKind != JsonValueKind.Null)
+            {
+                sets.Add($"{field} = @{field}");
+                cmd.Parameters.AddWithValue($"@{field}", ToSqlValue(val));
+            }
+        }
+
+        if (sets.Count == 0)
+        {
+            throw new InvalidOperationException("No se envió ningún campo para actualizar");
+        }
+
+        await using var conn = await OpenAsync(db, ct);
+        cmd.Connection = conn;
+        cmd.CommandText = $"UPDATE departamento SET {string.Join(", ", sets)} WHERE dep_id = @id";
+        cmd.Parameters.AddWithValue("@id", depId);
+
+        var rows = await cmd.ExecuteNonQueryAsync(ct);
+        _logger.LogInformation("UPDATE_DEPARTMENT db={Db} dep_id={DepId} rows={Rows}", db, depId, rows);
+        return new { depId, rowsAffected = rows };
+    }
+
+    public async Task<object> CreateCategoryAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+        var nombre = payload.GetProperty("nombre").GetString()
+            ?? throw new InvalidOperationException("payload.nombre es requerido");
+        var depId = payload.GetProperty("depId").GetInt32();
+
+        await using var conn = await OpenAsync(db, ct);
+
+        // El departamento padre debe existir (cat.dep_id es NOT NULL). Si
+        // Stockandria mando un dep_id inexistente, fallamos con mensaje claro.
+        await using (var depCheck = new MySqlCommand(
+            "SELECT dep_id FROM departamento WHERE dep_id = @depId LIMIT 1", conn))
+        {
+            depCheck.Parameters.AddWithValue("@depId", depId);
+            var dep = await depCheck.ExecuteScalarAsync(ct);
+            if (dep == null || dep == DBNull.Value)
+            {
+                throw new InvalidOperationException(
+                    $"El departamento dep_id={depId} no existe en SICAR.");
+            }
+        }
+
+        const string sql = @"
+            INSERT INTO categoria (nombre, system, status, dep_id)
+            VALUES (@nombre, FALSE, 1, @depId);
+            SELECT LAST_INSERT_ID();";
+
+        await using var cmd = new MySqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@nombre", nombre);
+        cmd.Parameters.AddWithValue("@depId", depId);
+        var catIdObj = await cmd.ExecuteScalarAsync(ct);
+        if (catIdObj == null || catIdObj == DBNull.Value)
+        {
+            throw new InvalidOperationException(
+                "CREATE_CATEGORY: no se obtuvo cat_id (LAST_INSERT_ID devolvió null).");
+        }
+        var catId = Convert.ToInt32(catIdObj);
+
+        _logger.LogInformation(
+            "CREATE_CATEGORY db={Db} cat_id={CatId} dep_id={DepId} nombre={Nombre}", db, catId, depId, nombre);
+        return new { catId, depId, nombre };
+    }
+
+    public async Task<object> UpdateCategoryAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+        var catId = payload.GetProperty("catId").GetInt32();
+        var fields = payload.GetProperty("fields");
+
+        var allowed = new[] { "nombre" };
+        var sets = new List<string>();
+        var cmd = new MySqlCommand();
+
+        foreach (var field in allowed)
+        {
+            if (fields.TryGetProperty(field, out var val) && val.ValueKind != JsonValueKind.Null)
+            {
+                sets.Add($"{field} = @{field}");
+                cmd.Parameters.AddWithValue($"@{field}", ToSqlValue(val));
+            }
+        }
+
+        if (sets.Count == 0)
+        {
+            throw new InvalidOperationException("No se envió ningún campo para actualizar");
+        }
+
+        await using var conn = await OpenAsync(db, ct);
+        cmd.Connection = conn;
+        cmd.CommandText = $"UPDATE categoria SET {string.Join(", ", sets)} WHERE cat_id = @id";
+        cmd.Parameters.AddWithValue("@id", catId);
+
+        var rows = await cmd.ExecuteNonQueryAsync(ct);
+        _logger.LogInformation("UPDATE_CATEGORY db={Db} cat_id={CatId} rows={Rows}", db, catId, rows);
+        return new { catId, rowsAffected = rows };
     }
 
     // -------------------------------------------------------------------------
