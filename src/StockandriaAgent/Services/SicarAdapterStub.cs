@@ -42,6 +42,18 @@ public class SicarAdapterStub : ISicarAdapter
         return Task.FromResult(response);
     }
 
+    public Task<object> SyncSalesAsync(JsonElement payload, CancellationToken ct)
+    {
+        object response = new { syncedCount = 0, sales = Array.Empty<object>(), stub = true };
+        return Task.FromResult(response);
+    }
+
+    public Task<object> SyncStockHistoryAsync(JsonElement payload, CancellationToken ct)
+    {
+        object response = new { syncedCount = 0, changes = Array.Empty<object>(), stub = true };
+        return Task.FromResult(response);
+    }
+
     public Task<object> SyncSuppliersAsync(JsonElement payload, CancellationToken ct)
     {
         object response = new { syncedCount = 10, errors = 0, stub = true };
@@ -71,6 +83,9 @@ public class SicarAdapterStub : ISicarAdapter
     public Task<object> UpdateMinMaxAsync(JsonElement payload, CancellationToken ct) =>
         Task.FromResult<object>(new { ok = true, stub = true });
 
+    public Task<object> BulkUpdateMinMaxAsync(JsonElement payload, CancellationToken ct) =>
+        Task.FromResult<object>(new { results = Array.Empty<object>(), stub = true });
+
     public Task<object> TransferStockAsync(JsonElement payload, CancellationToken ct) =>
         Task.FromResult<object>(new { ok = true, stub = true });
 
@@ -84,6 +99,22 @@ public class SicarAdapterStub : ISicarAdapter
         // Stub: simulamos un art_id ficticio para que el flujo end-to-end
         // de dev funcione sin SICAR real corriendo.
         Task.FromResult<object>(new { artId = 999999, clave = payload.TryGetProperty("clave", out var c) ? c.GetString() : "STUB", stub = true });
+
+    public Task<object> BulkInsertProductsAsync(JsonElement payload, CancellationToken ct)
+    {
+        var count = payload.TryGetProperty("items", out var items) && items.ValueKind == JsonValueKind.Array
+            ? items.GetArrayLength()
+            : 0;
+        return Task.FromResult<object>(new { inserted = count, skipped = 0, failed = Array.Empty<object>(), stub = true });
+    }
+
+    public Task<object> BulkUpdatePriceAsync(JsonElement payload, CancellationToken ct)
+    {
+        var count = payload.TryGetProperty("items", out var items) && items.ValueKind == JsonValueKind.Array
+            ? items.GetArrayLength()
+            : 0;
+        return Task.FromResult<object>(new { updated = count, failed = Array.Empty<object>(), stub = true });
+    }
 
     public Task<object> GetProductsAsync(JsonElement payload, CancellationToken ct)
     {

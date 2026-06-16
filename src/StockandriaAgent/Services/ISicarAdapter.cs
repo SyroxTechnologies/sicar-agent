@@ -28,6 +28,22 @@ public interface ISicarAdapter
     Task<object> GetStatusAsync(JsonElement payload, CancellationToken ct);
     Task<object> SyncProductsAsync(JsonElement payload, CancellationToken ct);
     Task<object> SyncStockAsync(JsonElement payload, CancellationToken ct);
+
+    /// <summary>
+    /// Trae las ventas agregadas por clave (SKU) + dia desde SICAR, acotadas
+    /// por rango [from, to) en el payload. Es el prerequisito del algoritmo de
+    /// pronostico de demanda. Solo lectura. La sucursal es la base de datos.
+    /// </summary>
+    Task<object> SyncSalesAsync(JsonElement payload, CancellationToken ct);
+
+    /// <summary>
+    /// Trae los cambios de existencia (estrategia comprimida) desde la foto
+    /// diaria de inventario de SICAR, acotados por rango [from, to). Emite una
+    /// fila solo cuando la existencia de un articulo cambia respecto al dia
+    /// anterior. Es la curva de inventario para detectar el agotamiento real.
+    /// Solo lectura. La sucursal es la base de datos.
+    /// </summary>
+    Task<object> SyncStockHistoryAsync(JsonElement payload, CancellationToken ct);
     Task<object> SyncSuppliersAsync(JsonElement payload, CancellationToken ct);
     Task<object> CreateBackupAsync(JsonElement payload, CancellationToken ct);
 
@@ -35,6 +51,7 @@ public interface ISicarAdapter
     Task<object> BulkAdjustStockAsync(JsonElement payload, CancellationToken ct);
     Task<object> UpdatePriceAsync(JsonElement payload, CancellationToken ct);
     Task<object> UpdateMinMaxAsync(JsonElement payload, CancellationToken ct);
+    Task<object> BulkUpdateMinMaxAsync(JsonElement payload, CancellationToken ct);
     Task<object> TransferStockAsync(JsonElement payload, CancellationToken ct);
     Task<object> UpdateSupplierAsync(JsonElement payload, CancellationToken ct);
     Task<object> UpdateProductAsync(JsonElement payload, CancellationToken ct);
@@ -48,6 +65,19 @@ public interface ISicarAdapter
     /// las bases sincronizadas.
     /// </summary>
     Task<object> InsertProductAsync(JsonElement payload, CancellationToken ct);
+
+    /// <summary>
+    /// INSERT masivo de productos faltantes en una sucursal (backfill). Inserta
+    /// solo los que no existan ya (por clave); resiliente por item.
+    /// </summary>
+    Task<object> BulkInsertProductsAsync(JsonElement payload, CancellationToken ct);
+
+    /// <summary>
+    /// UPDATE masivo de precios (precio1-4 + precioCompra) de muchos artículos en
+    /// un solo comando, recalculando margen. Resiliente por item. Evita el flood
+    /// de un UPDATE_PRICE por producto.
+    /// </summary>
+    Task<object> BulkUpdatePriceAsync(JsonElement payload, CancellationToken ct);
 
     Task<object> GetProductsAsync(JsonElement payload, CancellationToken ct);
     Task<object> GetStockAsync(JsonElement payload, CancellationToken ct);

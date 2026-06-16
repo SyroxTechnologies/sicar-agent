@@ -173,6 +173,109 @@ public class SicarAdapter : ISicarAdapter
         return new { database = db, syncedCount = stock.Count, stock };
     }
 
+    public async Task<object> SyncSalesAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+
+        // El sync de ventas SIEMPRE viene acotado por rango [from, to): el
+        // backfill historico lo llama mes a mes y el delta diario con la ventana
+        // del dia. Asi nunca se trae todo el historico de una sola vez.
+        var from = payload.TryGetProperty("from", out var f) ? f.GetString() : null;
+        var to = payload.TryGetProperty("to", out var t) ? t.GetString() : null;
+        if (string.IsNullOrWhiteSpace(from) || string.IsNullOrWhiteSpace(to))
+        {
+            throw new InvalidOperationException("SYNC_SALES requiere 'from' y 'to' (formato yyyy-MM-dd)");
+        }
+
+        await using var conn = await OpenAsync(db, ct);
+        var sales = new List<Dictionary<string, object?>>();
+
+        // Demanda real: solo ventas al cliente (status = 1) y se excluyen las
+        // ventas por ajuste de inventario (ventaPorAjuste = 1). Se agrega por
+        // clave (SKU) + dia en el propio SQL para no transferir las lineas
+        // crudas. La sucursal es la base de datos, no hay columna de sucursal.
+        const string sql = @"
+            SELECT d.clave AS clave,
+                   DATE(v.fecha) AS dia,
+                   SUM(d.cantidad) AS unidades,
+                   SUM(d.importeCon) AS ingreso,
+                   SUM(d.importeCompra) AS costo
+            FROM detallev d
+            JOIN venta v ON v.ven_id = d.ven_id
+            WHERE v.status = 1
+              AND v.ventaPorAjuste = 0
+              AND v.fecha >= @from
+              AND v.fecha < @to
+            GROUP BY d.clave, DATE(v.fecha)";
+
+        await using var cmd = new MySqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@from", from);
+        cmd.Parameters.AddWithValue("@to", to);
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            sales.Add(ReadRow(reader));
+        }
+
+        _logger.LogInformation(
+            "SYNC_SALES db={Db} from={From} to={To} rows={Rows}", db, from, to, sales.Count);
+        return new { database = db, from, to, syncedCount = sales.Count, sales };
+    }
+
+    public async Task<object> SyncStockHistoryAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+
+        var from = payload.TryGetProperty("from", out var f) ? f.GetString() : null;
+        var to = payload.TryGetProperty("to", out var t) ? t.GetString() : null;
+        if (string.IsNullOrWhiteSpace(from) || string.IsNullOrWhiteSpace(to))
+        {
+            throw new InvalidOperationException("SYNC_STOCK_HISTORY requiere 'from' y 'to' (formato yyyy-MM-dd)");
+        }
+
+        await using var conn = await OpenAsync(db, ct);
+        var changes = new List<Dictionary<string, object?>>();
+
+        // Estrategia comprimida: SICAR guarda una foto diaria de la existencia de
+        // cada articulo (inventariofecha tipo=1 + inventariofechaarticulo). En vez
+        // de transferir la foto completa, se emite una fila SOLO cuando la
+        // existencia cambia respecto al dia anterior (LAG). El rango arranca desde
+        // la foto inmediatamente anterior a @from (el ancla) para que el primer dia
+        // del rango se compare contra su valor real y no genere un cambio falso;
+        // luego se filtran las filas para devolver solo las que caen dentro de
+        // [from, to). Esto tambien hace funcionar el delta diario (1 solo dia).
+        const string sql = @"
+            SELECT clave, dia, existencia FROM (
+                SELECT ifa.clave AS clave,
+                       DATE(f.fecha) AS dia,
+                       f.fecha AS ts,
+                       ifa.existencia AS existencia,
+                       LAG(ifa.existencia) OVER (PARTITION BY ifa.clave ORDER BY f.fecha) AS prev
+                FROM inventariofechaarticulo ifa
+                JOIN inventariofecha f ON f.inf_id = ifa.inf_id
+                WHERE f.tipo = 1
+                  AND f.fecha >= COALESCE(
+                      (SELECT MAX(f2.fecha) FROM inventariofecha f2 WHERE f2.tipo = 1 AND f2.fecha < @from),
+                      @from)
+                  AND f.fecha < @to
+            ) t
+            WHERE t.ts >= @from AND (t.prev IS NULL OR t.existencia <> t.prev)
+            ORDER BY clave, dia";
+
+        await using var cmd = new MySqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@from", from);
+        cmd.Parameters.AddWithValue("@to", to);
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            changes.Add(ReadRow(reader));
+        }
+
+        _logger.LogInformation(
+            "SYNC_STOCK_HISTORY db={Db} from={From} to={To} rows={Rows}", db, from, to, changes.Count);
+        return new { database = db, from, to, syncedCount = changes.Count, changes };
+    }
+
     public async Task<object> SyncSuppliersAsync(JsonElement payload, CancellationToken ct)
     {
         var db = RequireDatabaseName(payload);
@@ -224,10 +327,10 @@ public class SicarAdapter : ISicarAdapter
     public async Task<object> AdjustStockAsync(JsonElement payload, CancellationToken ct)
     {
         var db = RequireDatabaseName(payload);
-        var artId = payload.GetProperty("artId").GetInt32();
         var newStock = payload.GetProperty("newStock").GetInt32();
 
         await using var conn = await OpenAsync(db, ct);
+        var artId = await ResolveArtIdAsync(payload, conn, ct);
         await using var cmd = new MySqlCommand(
             "UPDATE articulo SET existencia = @stock WHERE art_id = @id",
             conn);
@@ -258,7 +361,7 @@ public class SicarAdapter : ISicarAdapter
         {
             foreach (var adj in adjustments.EnumerateArray())
             {
-                var artId = adj.GetProperty("artId").GetInt32();
+                var artId = await ResolveArtIdAsync(adj, conn, ct, tx);
                 var newStock = adj.GetProperty("newStock").GetInt32();
 
                 await using var cmd = new MySqlCommand(
@@ -284,27 +387,74 @@ public class SicarAdapter : ISicarAdapter
     public async Task<object> UpdatePriceAsync(JsonElement payload, CancellationToken ct)
     {
         var db = RequireDatabaseName(payload);
-        var artId = payload.GetProperty("artId").GetInt32();
         var prices = payload.GetProperty("prices");
 
-        var sets = new List<string>();
-        var cmd = new MySqlCommand();
-
+        // Recolectar los precios enviados (precio1-4 + precioCompra).
+        var enviados = new Dictionary<string, decimal>();
         foreach (var prop in new[] { "precio1", "precio2", "precio3", "precio4", "precioCompra" })
         {
             if (prices.TryGetProperty(prop, out var val) && val.ValueKind == JsonValueKind.Number)
             {
-                sets.Add($"{prop} = @{prop}");
-                cmd.Parameters.AddWithValue($"@{prop}", val.GetDecimal());
+                enviados[prop] = val.GetDecimal();
             }
         }
 
-        if (sets.Count == 0)
+        if (enviados.Count == 0)
         {
             throw new InvalidOperationException("No se envió ningún precio para actualizar");
         }
 
         await using var conn = await OpenAsync(db, ct);
+        var artId = await ResolveArtIdAsync(payload, conn, ct);
+
+        // SICAR guarda margen1-4 (utilidad) por artículo y NO los recalcula solo
+        // al cambiar el precio. Para que no queden desactualizados los mantenemos
+        // consistentes acá con la misma fórmula que usa Stockandria
+        // (precio = costo * (1 + margen/100)  =>  margen = (precio/costo - 1) * 100).
+        // El costo es el precioCompra enviado en este mismo update; si no vino,
+        // se lee el actual del artículo.
+        decimal? costo = enviados.TryGetValue("precioCompra", out var pc) ? pc : null;
+        if (costo is null)
+        {
+            await using var costCmd = new MySqlCommand(
+                "SELECT precioCompra FROM articulo WHERE art_id = @id", conn);
+            costCmd.Parameters.AddWithValue("@id", artId);
+            var costResult = await costCmd.ExecuteScalarAsync(ct);
+            if (costResult is not null && costResult != DBNull.Value)
+            {
+                costo = Convert.ToDecimal(costResult);
+            }
+        }
+
+        var sets = new List<string>();
+        var cmd = new MySqlCommand();
+        foreach (var kv in enviados)
+        {
+            sets.Add($"{kv.Key} = @{kv.Key}");
+            cmd.Parameters.AddWithValue($"@{kv.Key}", kv.Value);
+        }
+
+        // Recalcular el margen de cada precio de venta enviado (solo si hay costo > 0).
+        if (costo is > 0m)
+        {
+            var niveles = new[]
+            {
+                ("precio1", "margen1"),
+                ("precio2", "margen2"),
+                ("precio3", "margen3"),
+                ("precio4", "margen4"),
+            };
+            foreach (var (precioProp, margenProp) in niveles)
+            {
+                if (enviados.TryGetValue(precioProp, out var precioVal))
+                {
+                    var margen = (precioVal / costo.Value - 1m) * 100m;
+                    sets.Add($"{margenProp} = @{margenProp}");
+                    cmd.Parameters.AddWithValue($"@{margenProp}", margen);
+                }
+            }
+        }
+
         cmd.Connection = conn;
         cmd.CommandText = $"UPDATE articulo SET {string.Join(", ", sets)} WHERE art_id = @id";
         cmd.Parameters.AddWithValue("@id", artId);
@@ -317,7 +467,6 @@ public class SicarAdapter : ISicarAdapter
     public async Task<object> UpdateMinMaxAsync(JsonElement payload, CancellationToken ct)
     {
         var db = RequireDatabaseName(payload);
-        var artId = payload.GetProperty("artId").GetInt32();
         var values = payload.GetProperty("values");
 
         var sets = new List<string>();
@@ -340,6 +489,7 @@ public class SicarAdapter : ISicarAdapter
         }
 
         await using var conn = await OpenAsync(db, ct);
+        var artId = await ResolveArtIdAsync(payload, conn, ct);
         cmd.Connection = conn;
         cmd.CommandText = $"UPDATE articulo SET {string.Join(", ", sets)} WHERE art_id = @id";
         cmd.Parameters.AddWithValue("@id", artId);
@@ -347,6 +497,61 @@ public class SicarAdapter : ISicarAdapter
         var rows = await cmd.ExecuteNonQueryAsync(ct);
         _logger.LogInformation("UPDATE_MIN_MAX db={Db} art_id={ArtId} rows={Rows}", db, artId, rows);
         return new { artId, rowsAffected = rows };
+    }
+
+    public async Task<object> BulkUpdateMinMaxAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+        var items = payload.GetProperty("items");
+        if (items.ValueKind != JsonValueKind.Array)
+        {
+            throw new InvalidOperationException("payload.items debe ser un array");
+        }
+
+        await using var conn = await OpenAsync(db, ct);
+        await using var tx = await conn.BeginTransactionAsync(ct);
+
+        var results = new List<object>();
+        try
+        {
+            foreach (var item in items.EnumerateArray())
+            {
+                // Cada item se ubica por `clave` (SKU) o `artId` — igual que el
+                // resto de los comandos de escritura (ver ResolveArtIdAsync).
+                var artId = await ResolveArtIdAsync(item, conn, ct, tx);
+
+                var sets = new List<string>();
+                await using var cmd = new MySqlCommand { Connection = conn, Transaction = tx };
+                if (item.TryGetProperty("invMin", out var min) && min.ValueKind == JsonValueKind.Number)
+                {
+                    sets.Add("invMin = @invMin");
+                    cmd.Parameters.AddWithValue("@invMin", min.GetInt32());
+                }
+                if (item.TryGetProperty("invMax", out var max) && max.ValueKind == JsonValueKind.Number)
+                {
+                    sets.Add("invMax = @invMax");
+                    cmd.Parameters.AddWithValue("@invMax", max.GetInt32());
+                }
+                if (sets.Count == 0)
+                {
+                    continue;
+                }
+                cmd.CommandText = $"UPDATE articulo SET {string.Join(", ", sets)} WHERE art_id = @id";
+                cmd.Parameters.AddWithValue("@id", artId);
+                var rows = await cmd.ExecuteNonQueryAsync(ct);
+                results.Add(new { artId, rowsAffected = rows });
+            }
+
+            await tx.CommitAsync(ct);
+        }
+        catch
+        {
+            await tx.RollbackAsync(CancellationToken.None);
+            throw;
+        }
+
+        _logger.LogInformation("BULK_UPDATE_MIN_MAX db={Db} items={Count}", db, results.Count);
+        return new { results };
     }
 
     public async Task<object> TransferStockAsync(JsonElement payload, CancellationToken ct)
@@ -407,7 +612,6 @@ public class SicarAdapter : ISicarAdapter
     public async Task<object> UpdateProductAsync(JsonElement payload, CancellationToken ct)
     {
         var db = RequireDatabaseName(payload);
-        var artId = payload.GetProperty("artId").GetInt32();
         var fields = payload.GetProperty("fields");
 
         // Whitelist: solo permitimos modificar campos comunes con Stockandria
@@ -427,12 +631,36 @@ public class SicarAdapter : ISicarAdapter
             }
         }
 
+        await using var conn = await OpenAsync(db, ct);
+        var artId = await ResolveArtIdAsync(payload, conn, ct);
+
+        // Reasignación de categoría: Stockandria manda el NOMBRE (no el cat_id),
+        // porque cada DB SICAR tiene su propio cat_id para la misma categoría.
+        // Resolvemos el cat_id por nombre en ESTA base. Si no existe, fallamos
+        // (Stockandria debe sincronizar la categoría antes).
+        if (fields.TryGetProperty("categoria", out var catEl)
+            && catEl.ValueKind == JsonValueKind.String)
+        {
+            var categoriaNombre = catEl.GetString() ?? "";
+            await using var catCmd = new MySqlCommand(
+                "SELECT cat_id FROM categoria WHERE nombre = @nombre LIMIT 1", conn);
+            catCmd.Parameters.AddWithValue("@nombre", categoriaNombre);
+            var catResult = await catCmd.ExecuteScalarAsync(ct);
+            if (catResult == null || catResult == DBNull.Value)
+            {
+                throw new InvalidOperationException(
+                    $"La categoría \"{categoriaNombre}\" no existe en SICAR. " +
+                    "Sincronizá categorías desde Stockandria antes de reasignar el producto.");
+            }
+            sets.Add("cat_id = @catId");
+            cmd.Parameters.AddWithValue("@catId", Convert.ToInt32(catResult));
+        }
+
         if (sets.Count == 0)
         {
             throw new InvalidOperationException("No se envió ningún campo para actualizar");
         }
 
-        await using var conn = await OpenAsync(db, ct);
         cmd.Connection = conn;
         cmd.CommandText = $"UPDATE articulo SET {string.Join(", ", sets)} WHERE art_id = @id";
         cmd.Parameters.AddWithValue("@id", artId);
@@ -593,6 +821,245 @@ public class SicarAdapter : ISicarAdapter
         _logger.LogInformation(
             "INSERT_PRODUCT db={Db} art_id={ArtId} clave={Clave}", db, artId, clave);
         return new { artId, clave };
+    }
+
+    /// <summary>
+    /// UPDATE de precios MASIVO: actualiza en UNA pasada los precios (precio1-4 +
+    /// precioCompra) de muchos artículos. Resuelve cada uno por `clave`, recalcula
+    /// margen1-4 = (precio/costo - 1) * 100 (igual que UpdatePriceAsync). Resiliente
+    /// por item: el que falle (no existe, etc.) se reporta y sigue. Evita el flood
+    /// de un UPDATE_PRICE por producto.
+    ///
+    /// Payload: { databaseName, items: [{ clave, precio1?, precio2?, precio3?,
+    ///   precio4?, precioCompra? }] }
+    /// Devuelve: { updated, failed: [{ clave, reason }] }
+    /// </summary>
+    public async Task<object> BulkUpdatePriceAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+        if (!payload.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array)
+        {
+            throw new InvalidOperationException("payload.items (array) es requerido");
+        }
+
+        await using var conn = await OpenAsync(db, ct);
+
+        var updated = 0;
+        var failed = new List<object>();
+        var priceProps = new[] { "precio1", "precio2", "precio3", "precio4", "precioCompra" };
+        var nivelMargen = new[]
+        {
+            ("precio1", "margen1"),
+            ("precio2", "margen2"),
+            ("precio3", "margen3"),
+            ("precio4", "margen4"),
+        };
+
+        foreach (var item in items.EnumerateArray())
+        {
+            var clave = GetOptionalString(item, "clave") ?? "";
+            if (string.IsNullOrWhiteSpace(clave))
+            {
+                failed.Add(new { clave, reason = "clave vacía" });
+                continue;
+            }
+
+            try
+            {
+                var enviados = new Dictionary<string, decimal>();
+                foreach (var prop in priceProps)
+                {
+                    if (item.TryGetProperty(prop, out var val) && val.ValueKind == JsonValueKind.Number)
+                    {
+                        enviados[prop] = val.GetDecimal();
+                    }
+                }
+                if (enviados.Count == 0)
+                {
+                    failed.Add(new { clave, reason = "sin precios para actualizar" });
+                    continue;
+                }
+
+                // Resolver art_id + costo actual por clave.
+                int artId;
+                decimal? costoActual = null;
+                await using (var idCmd = new MySqlCommand(
+                    "SELECT art_id, precioCompra FROM articulo WHERE clave = @c LIMIT 1", conn))
+                {
+                    idCmd.Parameters.AddWithValue("@c", clave);
+                    await using var rdr = await idCmd.ExecuteReaderAsync(ct);
+                    if (!await rdr.ReadAsync(ct))
+                    {
+                        failed.Add(new { clave, reason = $"El artículo con clave \"{clave}\" no existe en SICAR" });
+                        continue;
+                    }
+                    artId = rdr.GetInt32(0);
+                    if (!rdr.IsDBNull(1)) costoActual = rdr.GetDecimal(1);
+                }
+
+                var costo = enviados.TryGetValue("precioCompra", out var pc) ? pc : costoActual;
+
+                var sets = new List<string>();
+                var cmd = new MySqlCommand();
+                foreach (var kv in enviados)
+                {
+                    sets.Add($"{kv.Key} = @{kv.Key}");
+                    cmd.Parameters.AddWithValue($"@{kv.Key}", kv.Value);
+                }
+                if (costo is > 0m)
+                {
+                    foreach (var (precioProp, margenProp) in nivelMargen)
+                    {
+                        if (enviados.TryGetValue(precioProp, out var precioVal))
+                        {
+                            var margen = (precioVal / costo.Value - 1m) * 100m;
+                            sets.Add($"{margenProp} = @{margenProp}");
+                            cmd.Parameters.AddWithValue($"@{margenProp}", margen);
+                        }
+                    }
+                }
+
+                cmd.Connection = conn;
+                cmd.CommandText = $"UPDATE articulo SET {string.Join(", ", sets)} WHERE art_id = @id";
+                cmd.Parameters.AddWithValue("@id", artId);
+                await cmd.ExecuteNonQueryAsync(ct);
+                updated++;
+            }
+            catch (Exception ex)
+            {
+                failed.Add(new { clave, reason = ex.Message });
+            }
+        }
+
+        _logger.LogInformation(
+            "BULK_UPDATE_PRICE db={Db} updated={Updated} failed={Failed}", db, updated, failed.Count);
+        return new { updated, failed };
+    }
+
+    /// <summary>
+    /// INSERT masivo: inserta en UNA pasada todos los artículos del payload que
+    /// NO existan ya en la DB (por `clave`). Una sola conexión, precarga las
+    /// claves existentes y cachea cat_id/uni_id por nombre para no re-consultar.
+    /// Resiliente por item: si uno falla (categoría/unidad inexistente, etc.) se
+    /// reporta y sigue con el resto. Se usa en el backfill de productos faltantes.
+    ///
+    /// Payload: { databaseName, items: [{ clave, descripcion, precio,
+    ///   precioCompra, categoria, unidad, claveAlterna }] }
+    /// Devuelve: { inserted, skipped, failed: [{ clave, reason }] }
+    /// </summary>
+    public async Task<object> BulkInsertProductsAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+        if (!payload.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array)
+        {
+            throw new InvalidOperationException("payload.items (array) es requerido");
+        }
+
+        await using var conn = await OpenAsync(db, ct);
+
+        // Precargar las claves existentes: así saltamos duplicados sin un SELECT
+        // por cada item (idempotencia barata).
+        var existing = new HashSet<string>();
+        await using (var clavesCmd = new MySqlCommand("SELECT clave FROM articulo", conn))
+        await using (var reader = await clavesCmd.ExecuteReaderAsync(ct))
+        {
+            while (await reader.ReadAsync(ct))
+            {
+                if (!reader.IsDBNull(0)) existing.Add(reader.GetString(0));
+            }
+        }
+
+        var catCache = new Dictionary<string, int?>();
+        var uniCache = new Dictionary<string, int?>();
+
+        async Task<int?> ResolveId(Dictionary<string, int?> cache, string table, string idCol, string nombre)
+        {
+            if (cache.TryGetValue(nombre, out var cached)) return cached;
+            await using var cmd = new MySqlCommand(
+                $"SELECT {idCol} FROM {table} WHERE nombre = @n LIMIT 1", conn);
+            cmd.Parameters.AddWithValue("@n", nombre);
+            var res = await cmd.ExecuteScalarAsync(ct);
+            int? id = (res is null || res == DBNull.Value) ? null : Convert.ToInt32(res);
+            cache[nombre] = id;
+            return id;
+        }
+
+        const string insertSql = @"
+            INSERT INTO articulo (
+                clave, claveAlterna, descripcion, servicio, localizacion,
+                invMin, invMax, factor, precioCompra, preCompraProm,
+                margen1, margen2, margen3, margen4,
+                precio1, precio2, precio3, precio4,
+                mayoreo1, mayoreo2, mayoreo3, mayoreo4,
+                existencia, caracteristicas, cuentaPredial,
+                status, unidadCompra, unidadVenta, cat_id
+            ) VALUES (
+                @clave, @claveAlterna, @descripcion, FALSE, '',
+                0, 0, 1.000, @precioCompra, @precioCompra,
+                0.000000, 0.000000, 0.000000, 0.000000,
+                @precio, 0.000000, 0.000000, 0.000000,
+                0.000, 0.000, 0.000, 0.000,
+                0.0000, '', '',
+                1, @uni, @uni, @catId
+            );";
+
+        var inserted = 0;
+        var skipped = 0;
+        var failed = new List<object>();
+
+        foreach (var item in items.EnumerateArray())
+        {
+            var clave = GetOptionalString(item, "clave") ?? "";
+            if (string.IsNullOrWhiteSpace(clave)) { skipped++; continue; }
+            if (existing.Contains(clave)) { skipped++; continue; }
+
+            try
+            {
+                var descripcion = GetOptionalString(item, "descripcion") ?? clave;
+                var categoria = GetOptionalString(item, "categoria") ?? "";
+                var unidad = GetOptionalString(item, "unidad") ?? "PZA";
+                var claveAlterna = GetOptionalString(item, "claveAlterna") ?? "";
+                var precio = item.TryGetProperty("precio", out var pv) && pv.ValueKind == JsonValueKind.Number
+                    ? pv.GetDecimal() : 0m;
+                var precioCompra = item.TryGetProperty("precioCompra", out var pcv) && pcv.ValueKind == JsonValueKind.Number
+                    ? pcv.GetDecimal() : 0m;
+
+                var catId = await ResolveId(catCache, "categoria", "cat_id", categoria);
+                if (catId is null)
+                {
+                    failed.Add(new { clave, reason = $"La categoría \"{categoria}\" no existe en SICAR" });
+                    continue;
+                }
+                var uniId = await ResolveId(uniCache, "unidad", "uni_id", unidad);
+                if (uniId is null)
+                {
+                    failed.Add(new { clave, reason = $"La unidad \"{unidad}\" no existe en SICAR" });
+                    continue;
+                }
+
+                await using var cmd = new MySqlCommand(insertSql, conn);
+                cmd.Parameters.AddWithValue("@clave", clave);
+                cmd.Parameters.AddWithValue("@claveAlterna", claveAlterna);
+                cmd.Parameters.AddWithValue("@descripcion", descripcion);
+                cmd.Parameters.AddWithValue("@precioCompra", precioCompra);
+                cmd.Parameters.AddWithValue("@precio", precio);
+                cmd.Parameters.AddWithValue("@uni", uniId.Value);
+                cmd.Parameters.AddWithValue("@catId", catId.Value);
+                await cmd.ExecuteNonQueryAsync(ct);
+
+                inserted++;
+                existing.Add(clave);
+            }
+            catch (Exception ex)
+            {
+                failed.Add(new { clave, reason = ex.Message });
+            }
+        }
+
+        _logger.LogInformation(
+            "BULK_INSERT_PRODUCT db={Db} inserted={Inserted} skipped={Skipped} failed={Failed}",
+            db, inserted, skipped, failed.Count);
+        return new { inserted, skipped, failed };
     }
 
     public async Task<object> UpdateSupplierAsync(JsonElement payload, CancellationToken ct)
@@ -1260,6 +1727,43 @@ public class SicarAdapter : ISicarAdapter
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Resuelve el art_id del articulo a partir del payload. Cada DB SICAR (una
+    /// por sucursal) asigna un art_id distinto al mismo producto, pero la `clave`
+    /// (SKU) es identica en todas. Por eso, cuando el back hace broadcast a varias
+    /// sucursales, manda la `clave` y el agente la traduce al art_id local de ESTA
+    /// base.
+    ///
+    /// - Si el payload trae `clave` (string no vacio): resuelve el art_id por clave
+    ///   en esta DB. Si no existe, falla con mensaje claro.
+    /// - Si no trae `clave`: usa `artId` directo (comportamiento previo, compat).
+    ///
+    /// La conexion debe venir abierta por el caller. Si el caller esta dentro de
+    /// una transaccion, debe pasarla en `tx`: MySqlConnector exige que el comando
+    /// use la transaccion activa de la conexion (si no, lanza "The transaction
+    /// associated with this command is not the connection's active transaction").
+    /// </summary>
+    private async Task<int> ResolveArtIdAsync(
+        JsonElement payload, MySqlConnection conn, CancellationToken ct, MySqlTransaction? tx = null)
+    {
+        var clave = GetOptionalString(payload, "clave");
+        if (!string.IsNullOrWhiteSpace(clave))
+        {
+            await using var cmd = new MySqlCommand(
+                "SELECT art_id FROM articulo WHERE clave = @clave LIMIT 1", conn, tx);
+            cmd.Parameters.AddWithValue("@clave", clave);
+            var result = await cmd.ExecuteScalarAsync(ct);
+            if (result == null || result == DBNull.Value)
+            {
+                throw new InvalidOperationException(
+                    $"El artículo con clave \"{clave}\" no existe en SICAR.");
+            }
+            return Convert.ToInt32(result);
+        }
+
+        return payload.GetProperty("artId").GetInt32();
+    }
 
     private static string RequireDatabaseName(JsonElement payload)
     {
