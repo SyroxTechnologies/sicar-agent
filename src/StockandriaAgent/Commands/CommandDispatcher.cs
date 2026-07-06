@@ -53,6 +53,7 @@ public class CommandDispatcher
                 "GET_PRODUCT_MARGINS" => CommandResult.Ok(await _sicar.GetProductMarginsAsync(payload, ct)),
                 "GET_CATEGORIES" => CommandResult.Ok(await _sicar.GetCategoriesAsync(payload, ct)),
                 "GET_SUPPLIER_CATEGORIES" => CommandResult.Ok(await _sicar.GetSupplierCategoriesAsync(payload, ct)),
+                "GET_SUPPLIER_PRODUCTS" => CommandResult.Ok(await _sicar.GetSupplierProductsAsync(payload, ct)),
 
                 "CREATE_DEPARTMENT" => CommandResult.Ok(await _sicar.CreateDepartmentAsync(payload, ct)),
                 "UPDATE_DEPARTMENT" => CommandResult.Ok(await _sicar.UpdateDepartmentAsync(payload, ct)),

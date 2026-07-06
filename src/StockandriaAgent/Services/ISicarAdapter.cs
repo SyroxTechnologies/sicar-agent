@@ -102,6 +102,16 @@ public interface ISicarAdapter
     /// </summary>
     Task<object> GetSupplierCategoriesAsync(JsonElement payload, CancellationToken ct);
 
+    /// <summary>
+    /// Devuelve el mapeo COMPLETO producto -> proveedor con precio de compra y
+    /// fecha (tabla proveedorarticulo de SICAR), que es donde vive la relación
+    /// muchos-a-muchos: un mismo artículo puede comprarse a varios proveedores,
+    /// cada uno con su precioCompra. Sirve para la comparación "más barato por
+    /// producto" en Stockandria. Con `proId` filtra ese proveedor; sin él trae
+    /// todo. Devuelve clave (sku) y art_id (sicarCode) para el match.
+    /// </summary>
+    Task<object> GetSupplierProductsAsync(JsonElement payload, CancellationToken ct);
+
     // Escritura de catalogo (jerarquia departamento -> categoria). Los CREATE
     // devuelven el id generado por SICAR (dep_id / cat_id) para que Stockandria
     // lo guarde como sicarCode.

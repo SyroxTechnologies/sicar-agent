@@ -127,7 +127,7 @@ public class SicarAdapter : ISicarAdapter
         // columna del porcentaje varía según versión (`porcentaje`, `tasa`,
         // etc.). Devolvemos NULL para que el back aplique fallback 16%.
         const string sql = @"
-            SELECT a.art_id, a.clave, a.claveAlterna, a.descripcion,
+            SELECT a.art_id, a.clave, a.claveAlterna, a.caracteristicas, a.descripcion,
                    a.precio1, a.precio2, a.precio3, a.precio4,
                    a.precioCompra, a.existencia, a.invMin, a.invMax,
                    a.cat_id, a.status,
@@ -615,10 +615,10 @@ public class SicarAdapter : ISicarAdapter
         var fields = payload.GetProperty("fields");
 
         // Whitelist: solo permitimos modificar campos comunes con Stockandria
-        // (descripcion=name, clave=sku, claveAlterna=barcode, status=isActive).
-        // Los precios/stock/min-max tienen sus propios comandos (UPDATE_PRICE,
-        // ADJUST_STOCK, UPDATE_MIN_MAX) - no van por acá.
-        var allowed = new[] { "descripcion", "clave", "claveAlterna", "status" };
+        // (descripcion=name, clave=sku, claveAlterna=barcode, status=isActive,
+        // caracteristicas=códigos extra). Los precios/stock/min-max tienen sus
+        // propios comandos (UPDATE_PRICE, ADJUST_STOCK, UPDATE_MIN_MAX) - no van por acá.
+        var allowed = new[] { "descripcion", "clave", "claveAlterna", "caracteristicas", "status" };
         var sets = new List<string>();
         var cmd = new MySqlCommand();
 
@@ -716,6 +716,11 @@ public class SicarAdapter : ISicarAdapter
             && ca.ValueKind == JsonValueKind.String
                 ? ca.GetString() ?? ""
                 : "";
+        // Códigos extra del producto (columna caracteristicas en SICAR).
+        var caracteristicas = payload.TryGetProperty("caracteristicas", out var car)
+            && car.ValueKind == JsonValueKind.String
+                ? car.GetString() ?? ""
+                : "";
         var invMin = payload.TryGetProperty("invMin", out var mn)
             && mn.ValueKind == JsonValueKind.Number
                 ? mn.GetInt32()
@@ -791,7 +796,7 @@ public class SicarAdapter : ISicarAdapter
                 0.000000, 0.000000, 0.000000, 0.000000,
                 @precio, 0.000000, 0.000000, 0.000000,
                 0.000, 0.000, 0.000, 0.000,
-                0.0000, '', '',
+                0.0000, @caracteristicas, '',
                 1, @unidadCompra, @unidadVenta, @catId
             );
             SELECT LAST_INSERT_ID();";
@@ -799,6 +804,7 @@ public class SicarAdapter : ISicarAdapter
         await using var cmd = new MySqlCommand(sql, conn);
         cmd.Parameters.AddWithValue("@clave", clave);
         cmd.Parameters.AddWithValue("@claveAlterna", claveAlterna);
+        cmd.Parameters.AddWithValue("@caracteristicas", caracteristicas);
         cmd.Parameters.AddWithValue("@descripcion", descripcion);
         cmd.Parameters.AddWithValue("@invMin", invMin);
         cmd.Parameters.AddWithValue("@invMax", invMax);
@@ -1564,6 +1570,53 @@ public class SicarAdapter : ISicarAdapter
                 departamento = reader.IsDBNull(reader.GetOrdinal("departamento")) ? "" : reader.GetString(reader.GetOrdinal("departamento")),
                 catId = reader.GetInt32(reader.GetOrdinal("cat_id")),
                 categoria = reader.IsDBNull(reader.GetOrdinal("categoria")) ? "" : reader.GetString(reader.GetOrdinal("categoria")),
+            });
+        }
+
+        return new { rows };
+    }
+
+    public async Task<object> GetSupplierProductsAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+        await using var conn = await OpenAsync(db, ct);
+
+        // proveedorarticulo es la relacion muchos-a-muchos articulo <-> proveedor,
+        // con precioCompra y fecha por cada proveedor. A diferencia de SyncProducts
+        // (que toma LIMIT 1), aca traemos TODOS para poder comparar precios entre
+        // proveedores. Devolvemos clave (sku) y art_id (sicarCode) para el match.
+        var hasProId = payload.TryGetProperty("proId", out var proIdEl)
+            && proIdEl.ValueKind == JsonValueKind.Number;
+
+        var sql = @"
+            SELECT pa.pro_id, pa.art_id, a.clave, pa.claveProveedor,
+                   pa.precioCompra, pa.fecha
+            FROM proveedorarticulo pa
+            JOIN articulo a ON a.art_id = pa.art_id";
+        if (hasProId)
+        {
+            sql += " WHERE pa.pro_id = @proId";
+        }
+        sql += " ORDER BY a.clave ASC, pa.pro_id ASC";
+
+        await using var cmd = new MySqlCommand(sql, conn);
+        if (hasProId)
+        {
+            cmd.Parameters.AddWithValue("@proId", proIdEl.GetInt32());
+        }
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+        var rows = new List<object>();
+        while (await reader.ReadAsync(ct))
+        {
+            rows.Add(new
+            {
+                proId = reader.GetInt32(reader.GetOrdinal("pro_id")),
+                artId = reader.GetInt32(reader.GetOrdinal("art_id")),
+                clave = reader.IsDBNull(reader.GetOrdinal("clave")) ? "" : reader.GetString(reader.GetOrdinal("clave")),
+                claveProveedor = reader.IsDBNull(reader.GetOrdinal("claveProveedor")) ? "" : reader.GetString(reader.GetOrdinal("claveProveedor")),
+                precioCompra = reader.IsDBNull(reader.GetOrdinal("precioCompra")) ? (decimal?)null : reader.GetDecimal(reader.GetOrdinal("precioCompra")),
+                fecha = reader.IsDBNull(reader.GetOrdinal("fecha")) ? (DateTime?)null : reader.GetDateTime(reader.GetOrdinal("fecha")),
             });
         }
 
