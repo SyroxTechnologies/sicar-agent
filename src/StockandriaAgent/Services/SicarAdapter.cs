@@ -1068,13 +1068,101 @@ public class SicarAdapter : ISicarAdapter
         return new { inserted, skipped, failed };
     }
 
+    public async Task<object> InsertSupplierAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+        var fields = payload.GetProperty("fields");
+
+        string Campo(string nombre)
+        {
+            if (fields.TryGetProperty(nombre, out var val) && val.ValueKind != JsonValueKind.Null)
+            {
+                return ToSqlValue(val)?.ToString() ?? "";
+            }
+            return "";
+        }
+
+        var nombre = Campo("nombre");
+        if (string.IsNullOrWhiteSpace(nombre))
+        {
+            throw new InvalidOperationException("fields.nombre es requerido");
+        }
+
+        var diasCredito = 0;
+        if (fields.TryGetProperty("diasCredito", out var dc) && dc.ValueKind == JsonValueKind.Number)
+        {
+            diasCredito = dc.GetInt32();
+        }
+
+        await using var conn = await OpenAsync(db, ct);
+
+        // A diferencia de `departamento`, la tabla `proveedor` NO tiene el nombre
+        // como UNIQUE: SICAR acepta dos proveedores con el mismo nombre. Se
+        // chequea a mano para no duplicar cuando el backend reintenta.
+        await using (var check = new MySqlCommand(
+            "SELECT pro_id FROM proveedor WHERE nombre = @nombre AND status = 1 LIMIT 1", conn))
+        {
+            check.Parameters.AddWithValue("@nombre", nombre);
+            var existente = await check.ExecuteScalarAsync(ct);
+            if (existente != null)
+            {
+                return new { proId = Convert.ToInt32(existente), yaExistia = true };
+            }
+        }
+
+        // Todas las columnas de `proveedor` son NOT NULL sin default (menos la
+        // foto), asi que hay que mandarlas todas aunque vayan vacias.
+        const string sql = @"
+            INSERT INTO proveedor (
+                nombre, representante, alias, domicilio, noExt, noInt,
+                localidad, ciudad, estado, pais, codigoPostal, colonia,
+                rfc, curp, telefono, celular, mail, comentario,
+                status, limite, diasCredito
+            ) VALUES (
+                @nombre, @representante, @alias, @domicilio, @noExt, @noInt,
+                @localidad, @ciudad, @estado, @pais, @codigoPostal, @colonia,
+                @rfc, @curp, @telefono, @celular, @mail, @comentario,
+                1, 0.00, @diasCredito
+            );
+            SELECT LAST_INSERT_ID();";
+
+        await using var cmd = new MySqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@nombre", nombre);
+        cmd.Parameters.AddWithValue("@representante", Campo("representante"));
+        cmd.Parameters.AddWithValue("@alias", Campo("alias"));
+        cmd.Parameters.AddWithValue("@domicilio", Campo("domicilio"));
+        cmd.Parameters.AddWithValue("@noExt", Campo("noExt"));
+        cmd.Parameters.AddWithValue("@noInt", Campo("noInt"));
+        cmd.Parameters.AddWithValue("@localidad", Campo("localidad"));
+        cmd.Parameters.AddWithValue("@ciudad", Campo("ciudad"));
+        cmd.Parameters.AddWithValue("@estado", Campo("estado"));
+        cmd.Parameters.AddWithValue("@pais", Campo("pais"));
+        cmd.Parameters.AddWithValue("@codigoPostal", Campo("codigoPostal"));
+        cmd.Parameters.AddWithValue("@colonia", Campo("colonia"));
+        cmd.Parameters.AddWithValue("@rfc", Campo("rfc"));
+        cmd.Parameters.AddWithValue("@curp", Campo("curp"));
+        cmd.Parameters.AddWithValue("@telefono", Campo("telefono"));
+        cmd.Parameters.AddWithValue("@celular", Campo("celular"));
+        cmd.Parameters.AddWithValue("@mail", Campo("mail"));
+        cmd.Parameters.AddWithValue("@comentario", Campo("comentario"));
+        cmd.Parameters.AddWithValue("@diasCredito", diasCredito);
+
+        var result = await cmd.ExecuteScalarAsync(ct);
+        var proId = Convert.ToInt32(result);
+
+        return new { proId, yaExistia = false };
+    }
+
     public async Task<object> UpdateSupplierAsync(JsonElement payload, CancellationToken ct)
     {
         var db = RequireDatabaseName(payload);
         var proId = payload.GetProperty("proId").GetInt32();
         var fields = payload.GetProperty("fields");
 
-        var allowed = new[] { "nombre", "alias", "rfc", "direccion", "telefono", "correo", "diasCredito" };
+        // Nombres REALES de las columnas de `proveedor`. No hay `direccion` ni
+        // `correo`: son `domicilio` y `mail`. Usar los nombres viejos hacia
+        // fallar el UPDATE entero con "Unknown column".
+        var allowed = new[] { "nombre", "alias", "rfc", "domicilio", "telefono", "mail", "diasCredito" };
         var sets = new List<string>();
         var cmd = new MySqlCommand();
 
@@ -1525,6 +1613,37 @@ public class SicarAdapter : ISicarAdapter
         return new { categories = rows };
     }
 
+    public async Task<object> GetDepartmentsAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+        await using var conn = await OpenAsync(db, ct);
+
+        // Sin JOIN contra categoria: el backend necesita ver tambien los
+        // departamentos vacios para resolver su dep_id por nombre antes de
+        // crear o renombrar. Cada DB SICAR es autoincrement independiente, asi
+        // que el mismo departamento puede tener distinto dep_id por sucursal.
+        const string sql = @"
+            SELECT dep_id, nombre
+            FROM departamento
+            WHERE status = 1
+            ORDER BY nombre ASC";
+
+        await using var cmd = new MySqlCommand(sql, conn);
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+        var rows = new List<object>();
+        while (await reader.ReadAsync(ct))
+        {
+            rows.Add(new
+            {
+                depId = reader.GetInt32(reader.GetOrdinal("dep_id")),
+                nombre = reader.IsDBNull(reader.GetOrdinal("nombre")) ? "" : reader.GetString(reader.GetOrdinal("nombre")),
+            });
+        }
+
+        return new { departments = rows };
+    }
+
     public async Task<object> GetSupplierCategoriesAsync(JsonElement payload, CancellationToken ct)
     {
         var db = RequireDatabaseName(payload);
@@ -1646,7 +1765,7 @@ public class SicarAdapter : ISicarAdapter
         }
 
         const string sql = @"
-            INSERT INTO departamento (nombre, restringido, porcentaje, system, status)
+            INSERT INTO departamento (nombre, restringido, porcentaje, `system`, status)
             VALUES (@nombre, FALSE, 0.00, FALSE, 1);
             SELECT LAST_INSERT_ID();";
 
@@ -1723,7 +1842,7 @@ public class SicarAdapter : ISicarAdapter
         }
 
         const string sql = @"
-            INSERT INTO categoria (nombre, system, status, dep_id)
+            INSERT INTO categoria (nombre, `system`, status, dep_id)
             VALUES (@nombre, FALSE, 1, @depId);
             SELECT LAST_INSERT_ID();";
 

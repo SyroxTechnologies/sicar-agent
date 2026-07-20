@@ -42,6 +42,7 @@ public class CommandDispatcher
                 "BULK_UPDATE_MIN_MAX" => CommandResult.Ok(await _sicar.BulkUpdateMinMaxAsync(payload, ct)),
                 "TRANSFER_STOCK" => CommandResult.Ok(await _sicar.TransferStockAsync(payload, ct)),
                 "UPDATE_SUPPLIER" => CommandResult.Ok(await _sicar.UpdateSupplierAsync(payload, ct)),
+                "INSERT_SUPPLIER" => CommandResult.Ok(await _sicar.InsertSupplierAsync(payload, ct)),
                 "UPDATE_PRODUCT" => CommandResult.Ok(await _sicar.UpdateProductAsync(payload, ct)),
                 "INSERT_PRODUCT" => CommandResult.Ok(await _sicar.InsertProductAsync(payload, ct)),
                 "BULK_INSERT_PRODUCT" => CommandResult.Ok(await _sicar.BulkInsertProductsAsync(payload, ct)),
@@ -52,6 +53,7 @@ public class CommandDispatcher
                 "GET_SUPPLIERS" => CommandResult.Ok(await _sicar.GetSuppliersAsync(payload, ct)),
                 "GET_PRODUCT_MARGINS" => CommandResult.Ok(await _sicar.GetProductMarginsAsync(payload, ct)),
                 "GET_CATEGORIES" => CommandResult.Ok(await _sicar.GetCategoriesAsync(payload, ct)),
+                "GET_DEPARTMENTS" => CommandResult.Ok(await _sicar.GetDepartmentsAsync(payload, ct)),
                 "GET_SUPPLIER_CATEGORIES" => CommandResult.Ok(await _sicar.GetSupplierCategoriesAsync(payload, ct)),
                 "GET_SUPPLIER_PRODUCTS" => CommandResult.Ok(await _sicar.GetSupplierProductsAsync(payload, ct)),
 

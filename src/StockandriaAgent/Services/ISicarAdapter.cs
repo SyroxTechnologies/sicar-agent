@@ -54,6 +54,13 @@ public interface ISicarAdapter
     Task<object> BulkUpdateMinMaxAsync(JsonElement payload, CancellationToken ct);
     Task<object> TransferStockAsync(JsonElement payload, CancellationToken ct);
     Task<object> UpdateSupplierAsync(JsonElement payload, CancellationToken ct);
+
+    /// <summary>
+    /// Da de alta un proveedor. Idempotente: si ya existe uno activo con ese
+    /// nombre devuelve su pro_id sin insertar (la tabla `proveedor` no tiene el
+    /// nombre como UNIQUE, asi que SICAR aceptaria el duplicado).
+    /// </summary>
+    Task<object> InsertSupplierAsync(JsonElement payload, CancellationToken ct);
     Task<object> UpdateProductAsync(JsonElement payload, CancellationToken ct);
 
     /// <summary>
@@ -92,6 +99,13 @@ public interface ISicarAdapter
     /// lista para descubrir a que departamento pertenece.
     /// </summary>
     Task<object> GetCategoriesAsync(JsonElement payload, CancellationToken ct);
+
+    /// <summary>
+    /// Devuelve los departamentos activos, incluidos los que todavia no tienen
+    /// ninguna categoria. GET_CATEGORIES no sirve para eso porque parte de la
+    /// tabla categoria y un departamento vacio nunca aparece en su JOIN.
+    /// </summary>
+    Task<object> GetDepartmentsAsync(JsonElement payload, CancellationToken ct);
 
     /// <summary>
     /// Devuelve el mapeo proveedor -> departamento -> categoría inferido desde
