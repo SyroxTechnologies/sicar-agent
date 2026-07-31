@@ -54,6 +54,12 @@ public class SicarAdapterStub : ISicarAdapter
         return Task.FromResult(response);
     }
 
+    public Task<object> SyncPurchaseHistoryAsync(JsonElement payload, CancellationToken ct)
+    {
+        object response = new { syncedCount = 0, changes = Array.Empty<object>(), stub = true };
+        return Task.FromResult(response);
+    }
+
     public Task<object> SyncSuppliersAsync(JsonElement payload, CancellationToken ct)
     {
         object response = new { syncedCount = 10, errors = 0, stub = true };

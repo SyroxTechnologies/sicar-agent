@@ -31,6 +31,7 @@ public class CommandDispatcher
                 "SYNC_STOCK" => CommandResult.Ok(await _sicar.SyncStockAsync(payload, ct)),
                 "SYNC_SALES" => CommandResult.Ok(await _sicar.SyncSalesAsync(payload, ct)),
                 "SYNC_STOCK_HISTORY" => CommandResult.Ok(await _sicar.SyncStockHistoryAsync(payload, ct)),
+                "SYNC_PURCHASE_HISTORY" => CommandResult.Ok(await _sicar.SyncPurchaseHistoryAsync(payload, ct)),
                 "SYNC_SUPPLIERS" => CommandResult.Ok(await _sicar.SyncSuppliersAsync(payload, ct)),
                 "CREATE_BACKUP" => CommandResult.Ok(await _sicar.CreateBackupAsync(payload, ct)),
 

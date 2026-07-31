@@ -419,6 +419,54 @@ public class SicarAdapter : ISicarAdapter
         return new { database = db, from, to, syncedCount = changes.Count, changes };
     }
 
+    public async Task<object> SyncPurchaseHistoryAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+
+        var from = payload.TryGetProperty("from", out var f) ? f.GetString() : null;
+        var to = payload.TryGetProperty("to", out var t) ? t.GetString() : null;
+        if (string.IsNullOrWhiteSpace(from) || string.IsNullOrWhiteSpace(to))
+        {
+            throw new InvalidOperationException("SYNC_PURCHASE_HISTORY requiere 'from' y 'to' (formato yyyy-MM-dd)");
+        }
+
+        await using var conn = await OpenAsync(db, ct);
+        var purchases = new List<Dictionary<string, object?>>();
+
+        // Historial de costos: una fila por articulo y dia con compra, con el
+        // costo por PIEZA de ese dia. detallec guarda cantidad en unidad de
+        // compra y factor piezas-por-unidad, asi que el costo por pieza sale de
+        // importeSin / (cantidad * factor): robusto aunque se compre por caja.
+        // Si el mismo dia hubo varias compras del articulo se promedia ponderado
+        // (SUM importe / SUM piezas). Solo compras aplicadas (status = 1).
+        const string sql = @"
+            SELECT dc.clave AS clave,
+                   DATE(c.fecha) AS dia,
+                   SUM(dc.importeSin) AS importe,
+                   SUM(dc.cantidad * dc.factor) AS piezas
+            FROM compra c
+            JOIN detallec dc ON dc.com_id = c.com_id
+            WHERE c.status = 1
+              AND c.fecha >= @from AND c.fecha < @to
+              AND dc.cantidad > 0
+            GROUP BY dc.clave, DATE(c.fecha)
+            HAVING SUM(dc.cantidad * dc.factor) > 0
+            ORDER BY clave, dia";
+
+        await using var cmd = new MySqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@from", from);
+        cmd.Parameters.AddWithValue("@to", to);
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            purchases.Add(ReadRow(reader));
+        }
+
+        _logger.LogInformation(
+            "SYNC_PURCHASE_HISTORY db={Db} from={From} to={To} rows={Rows}", db, from, to, purchases.Count);
+        return new { database = db, from, to, syncedCount = purchases.Count, purchases };
+    }
+
     public async Task<object> SyncSuppliersAsync(JsonElement payload, CancellationToken ct)
     {
         var db = RequireDatabaseName(payload);

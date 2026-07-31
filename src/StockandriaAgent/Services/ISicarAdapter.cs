@@ -44,6 +44,12 @@ public interface ISicarAdapter
     /// Solo lectura. La sucursal es la base de datos.
     /// </summary>
     Task<object> SyncStockHistoryAsync(JsonElement payload, CancellationToken ct);
+
+    /// <summary>
+    /// Historial de compras: costo por pieza por articulo y dia, desde la tabla
+    /// compra/detallec de SICAR. Alimenta el costo vigente por fecha del GMROI.
+    /// </summary>
+    Task<object> SyncPurchaseHistoryAsync(JsonElement payload, CancellationToken ct);
     Task<object> SyncSuppliersAsync(JsonElement payload, CancellationToken ct);
     Task<object> CreateBackupAsync(JsonElement payload, CancellationToken ct);
 
