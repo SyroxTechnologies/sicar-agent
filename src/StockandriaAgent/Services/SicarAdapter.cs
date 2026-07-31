@@ -208,18 +208,161 @@ public class SicarAdapter : ISicarAdapter
               AND v.fecha < @to
             GROUP BY d.clave, DATE(v.fecha)";
 
-        await using var cmd = new MySqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@from", from);
-        cmd.Parameters.AddWithValue("@to", to);
-        await using var reader = await cmd.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
+        await using (var cmd = new MySqlCommand(sql, conn))
         {
-            sales.Add(ReadRow(reader));
+            cmd.Parameters.AddWithValue("@from", from);
+            cmd.Parameters.AddWithValue("@to", to);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                sales.Add(ReadRow(reader));
+            }
+        }
+
+        // Ticket promedio (BTP): resumen de tickets por dia. Un ticket = una venta
+        // (ven_id distinto). El total y la utilidad se calculan sobre las lineas
+        // (importeCon / importeCon - importeCompra) para que reconcilien con las
+        // ventas por producto. Mismos filtros (status = 1, sin ajustes) y mismo
+        // rango. El reader anterior ya se cerro: MySQL no permite dos abiertos.
+        var ticketSummary = new List<Dictionary<string, object?>>();
+        const string ticketSql = @"
+            SELECT DATE(v.fecha) AS dia,
+                   COUNT(DISTINCT v.ven_id) AS tickets,
+                   SUM(d.importeCon) AS total,
+                   SUM(d.importeCon) - SUM(COALESCE(d.importeCompra, 0)) AS utilidad
+            FROM detallev d
+            JOIN venta v ON v.ven_id = d.ven_id
+            WHERE v.status = 1
+              AND v.ventaPorAjuste = 0
+              AND v.fecha >= @from
+              AND v.fecha < @to
+            GROUP BY DATE(v.fecha)";
+
+        await using (var cmdTicket = new MySqlCommand(ticketSql, conn))
+        {
+            cmdTicket.Parameters.AddWithValue("@from", from);
+            cmdTicket.Parameters.AddWithValue("@to", to);
+            await using var readerTicket = await cmdTicket.ExecuteReaderAsync(ct);
+            while (await readerTicket.ReadAsync(ct))
+            {
+                ticketSummary.Add(ReadRow(readerTicket));
+            }
+        }
+
+        // Venta por hora / pico horario: mismas ventas agregadas por dia + hora del
+        // dia (0-23). Sirve para saber en que franjas se vende mas (abrir/cerrar).
+        // Mismos filtros y rango. El reader anterior ya se cerro.
+        var hourlySummary = new List<Dictionary<string, object?>>();
+        const string hourlySql = @"
+            SELECT DATE(v.fecha) AS dia,
+                   HOUR(v.fecha) AS hora,
+                   COUNT(DISTINCT v.ven_id) AS tickets,
+                   SUM(d.importeCon) AS total
+            FROM detallev d
+            JOIN venta v ON v.ven_id = d.ven_id
+            WHERE v.status = 1
+              AND v.ventaPorAjuste = 0
+              AND v.fecha >= @from
+              AND v.fecha < @to
+            GROUP BY DATE(v.fecha), HOUR(v.fecha)";
+
+        await using (var cmdHourly = new MySqlCommand(hourlySql, conn))
+        {
+            cmdHourly.Parameters.AddWithValue("@from", from);
+            cmdHourly.Parameters.AddWithValue("@to", to);
+            await using var readerHourly = await cmdHourly.ExecuteReaderAsync(ct);
+            while (await readerHourly.ReadAsync(ct))
+            {
+                hourlySummary.Add(ReadRow(readerHourly));
+            }
+        }
+
+        // Ventas por VENDEDOR (meet-24 / reportes.md sec. 5): quien hizo la venta.
+        // En SICAR el vendedor cuelga de la venta (venta.vnd_id -> vendedor). Se
+        // traen dos agregaciones porque responden cosas distintas:
+        //
+        //  - sellerSummary (dia + vendedor): tickets, venta y utilidad. Los
+        //    tickets NO se pueden sumar desde el detalle por producto (un mismo
+        //    ticket tiene varias lineas), por eso va aparte.
+        //  - productSellerSummary (dia + producto + vendedor): quien vendio cada
+        //    producto, para el historial de movimientos.
+        //
+        // Las ventas sin vendedor (vnd_id NULL) se traen igual con vendedor 0 /
+        // nombre vacio: son ventas reales y no se pueden perder.
+        var sellerSummary = new List<Dictionary<string, object?>>();
+        const string sellerSql = @"
+            SELECT DATE(v.fecha) AS dia,
+                   COALESCE(v.vnd_id, 0) AS vendedorId,
+                   COALESCE(vd.nombre, '') AS vendedor,
+                   COUNT(DISTINCT v.ven_id) AS tickets,
+                   SUM(d.importeCon) AS total,
+                   SUM(d.importeCon) - SUM(COALESCE(d.importeCompra, 0)) AS utilidad,
+                   SUM(d.cantidad) AS unidades
+            FROM detallev d
+            JOIN venta v ON v.ven_id = d.ven_id
+            LEFT JOIN vendedor vd ON vd.vnd_id = v.vnd_id
+            WHERE v.status = 1
+              AND v.ventaPorAjuste = 0
+              AND v.fecha >= @from
+              AND v.fecha < @to
+            GROUP BY DATE(v.fecha), COALESCE(v.vnd_id, 0), COALESCE(vd.nombre, '')";
+
+        await using (var cmdSeller = new MySqlCommand(sellerSql, conn))
+        {
+            cmdSeller.Parameters.AddWithValue("@from", from);
+            cmdSeller.Parameters.AddWithValue("@to", to);
+            await using var readerSeller = await cmdSeller.ExecuteReaderAsync(ct);
+            while (await readerSeller.ReadAsync(ct))
+            {
+                sellerSummary.Add(ReadRow(readerSeller));
+            }
+        }
+
+        var productSellerSummary = new List<Dictionary<string, object?>>();
+        const string productSellerSql = @"
+            SELECT d.clave AS clave,
+                   DATE(v.fecha) AS dia,
+                   COALESCE(v.vnd_id, 0) AS vendedorId,
+                   COALESCE(vd.nombre, '') AS vendedor,
+                   SUM(d.cantidad) AS unidades,
+                   SUM(d.importeCon) AS ingreso,
+                   SUM(d.importeCompra) AS costo
+            FROM detallev d
+            JOIN venta v ON v.ven_id = d.ven_id
+            LEFT JOIN vendedor vd ON vd.vnd_id = v.vnd_id
+            WHERE v.status = 1
+              AND v.ventaPorAjuste = 0
+              AND v.fecha >= @from
+              AND v.fecha < @to
+            GROUP BY d.clave, DATE(v.fecha), COALESCE(v.vnd_id, 0), COALESCE(vd.nombre, '')";
+
+        await using (var cmdProductSeller = new MySqlCommand(productSellerSql, conn))
+        {
+            cmdProductSeller.Parameters.AddWithValue("@from", from);
+            cmdProductSeller.Parameters.AddWithValue("@to", to);
+            await using var readerProductSeller = await cmdProductSeller.ExecuteReaderAsync(ct);
+            while (await readerProductSeller.ReadAsync(ct))
+            {
+                productSellerSummary.Add(ReadRow(readerProductSeller));
+            }
         }
 
         _logger.LogInformation(
-            "SYNC_SALES db={Db} from={From} to={To} rows={Rows}", db, from, to, sales.Count);
-        return new { database = db, from, to, syncedCount = sales.Count, sales };
+            "SYNC_SALES db={Db} from={From} to={To} rows={Rows} ticketDays={TicketDays} hourlyRows={HourlyRows} sellerRows={SellerRows} productSellerRows={ProductSellerRows}",
+            db, from, to, sales.Count, ticketSummary.Count, hourlySummary.Count,
+            sellerSummary.Count, productSellerSummary.Count);
+        return new
+        {
+            database = db,
+            from,
+            to,
+            syncedCount = sales.Count,
+            sales,
+            ticketSummary,
+            hourlySummary,
+            sellerSummary,
+            productSellerSummary,
+        };
     }
 
     public async Task<object> SyncStockHistoryAsync(JsonElement payload, CancellationToken ct)

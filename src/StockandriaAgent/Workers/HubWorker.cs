@@ -23,6 +23,15 @@ public class HubWorker : BackgroundService
     private const string EvtAgentHeartbeat = "agent-heartbeat";
     private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(30);
 
+    // Reporte del resultado: cuantas veces reintentar y cuanto esperar a que la
+    // libreria reconecte antes de cada intento. El backend le da 24hs de plazo a
+    // un comando, asi que insistir un par de minutos es barato al lado de perder
+    // el resultado de un mes entero de ventas.
+    private const int MaxReportAttempts = 6;
+    private static readonly TimeSpan ReportRetryDelay = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan ReconnectWaitTimeout = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan ReconnectPollInterval = TimeSpan.FromMilliseconds(250);
+
     private readonly AgentSession _session;
     private readonly CommandDispatcher _dispatcher;
     private readonly ISicarAdapter _sicar;
@@ -129,9 +138,18 @@ public class HubWorker : BackgroundService
         _logger.LogError("Error de Socket.io: {Error}", error);
     }
 
+    /// <summary>
+    /// Ejecuta el comando y reporta el resultado. EJECUTAR y REPORTAR van por
+    /// separado a proposito: antes, si el socket se caia justo al emitir, la
+    /// excepcion del emit se trataba como si el comando hubiera fallado y el
+    /// trabajo ya hecho (por ejemplo, un mes entero de ventas leido de SICAR) se
+    /// perdia sin dejar rastro. Ahora el resultado se guarda y se reintenta.
+    /// </summary>
     private async Task HandleExecuteCommand(SocketIOResponse response)
     {
         BackendCommand? command = null;
+        CommandResult result;
+
         try
         {
             var payload = response.GetValue<JsonElement>();
@@ -152,40 +170,93 @@ public class HubWorker : BackgroundService
             _logger.LogInformation("Comando recibido: id={CommandId} type={Type}",
                 command.Id, command.Type);
 
-            var result = await _dispatcher.DispatchAsync(command, CancellationToken.None);
-
-            if (_socket is not null)
-            {
-                await _socket.EmitAsync(EvtReportResult, new
-                {
-                    commandId = command.Id,
-                    status = result.Status == "SUCCESS" ? "SUCCESS" : "FAILED",
-                    resultPayload = result.ResultPayload,
-                    errorMessage = result.ErrorMessage,
-                });
-            }
+            result = await _dispatcher.DispatchAsync(command, CancellationToken.None);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error procesando comando {CommandId}", command?.Id);
+            _logger.LogError(ex, "Error ejecutando comando {CommandId}", command?.Id);
+            if (command is null) return;
+            result = CommandResult.Fail(ex.Message);
+        }
 
-            if (_socket is not null && command is not null)
+        await ReportResultAsync(command.Id, result);
+    }
+
+    /// <summary>
+    /// Emite el resultado al hub, esperando la reconexion y reintentando si el
+    /// socket se cayo. Un emit sobre un socket que se acaba de desconectar tira
+    /// ObjectDisposedException dentro de la libreria, asi que no alcanza con
+    /// mirar `Connected` una sola vez: hay que reintentar de verdad.
+    /// </summary>
+    private async Task ReportResultAsync(string commandId, CommandResult result)
+    {
+        var payload = new
+        {
+            commandId,
+            status = result.Status == CommandResultStatus.Success
+                ? CommandResultStatus.Success
+                : CommandResultStatus.Failed,
+            resultPayload = result.ResultPayload,
+            errorMessage = result.ErrorMessage,
+        };
+
+        for (var intento = 1; intento <= MaxReportAttempts; intento++)
+        {
+            try
             {
-                try
+                if (await WaitForConnectionAsync())
                 {
-                    await _socket.EmitAsync(EvtReportResult, new
+                    await _socket!.EmitAsync(EvtReportResult, payload);
+                    if (intento > 1)
                     {
-                        commandId = command.Id,
-                        status = "FAILED",
-                        errorMessage = ex.Message,
-                    });
+                        _logger.LogInformation(
+                            "Resultado de {CommandId} reportado en el intento {Intento}",
+                            commandId, intento);
+                    }
+                    return;
                 }
-                catch
-                {
-                    // Si falla reportar, el backend marcara TIMEOUT al vencer.
-                }
+
+                _logger.LogWarning(
+                    "Sin conexión al hub para reportar {CommandId} (intento {Intento}/{Total})",
+                    commandId, intento, MaxReportAttempts);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Falló el envío del resultado de {CommandId} (intento {Intento}/{Total})",
+                    commandId, intento, MaxReportAttempts);
+            }
+
+            if (intento < MaxReportAttempts)
+            {
+                await Task.Delay(ReportRetryDelay);
             }
         }
+
+        // Se agotaron los reintentos: el backend lo va a dar por vencido. Queda
+        // logueado con el id para poder resincronizar ese rango a mano.
+        _logger.LogError(
+            "No se pudo reportar el resultado del comando {CommandId} después de {Total} intentos. " +
+            "El backend lo va a marcar como vencido; hay que volver a sincronizar ese rango.",
+            commandId, MaxReportAttempts);
+    }
+
+    /// <summary>
+    /// Espera a que la libreria termine de reconectar, hasta un tope. Devuelve
+    /// false si sigue caido: ahi el llamador reintenta o se rinde.
+    /// </summary>
+    private async Task<bool> WaitForConnectionAsync()
+    {
+        if (_socket is null) return false;
+        if (_socket.Connected) return true;
+
+        var limite = DateTime.UtcNow + ReconnectWaitTimeout;
+        while (DateTime.UtcNow < limite)
+        {
+            await Task.Delay(ReconnectPollInterval);
+            if (_socket.Connected) return true;
+        }
+        return false;
     }
 
     private async Task SendHeartbeatAsync(CancellationToken ct)
