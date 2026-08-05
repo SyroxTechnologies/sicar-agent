@@ -655,6 +655,181 @@ public class SicarAdapter : ISicarAdapter
         return new { artId, rowsAffected = rows };
     }
 
+    /// <summary>
+    /// Actualiza el precio de compra de un producto PARA UN PROVEEDOR en SICAR
+    /// (tabla proveedorarticulo, la misma que alimenta el sync de precios por
+    /// proveedor). No toca articulo.precioCompra: el costo general del producto
+    /// se cambia con UPDATE_PRICE.
+    ///
+    /// Payload: { databaseName, clave | artId, proId, precioCompra }
+    ///   - clave/artId: el producto (igual que UPDATE_PRICE).
+    ///   - proId: pro_id del proveedor en SICAR (sicarCode del supplier).
+    ///   - precioCompra: precio por pieza para ese proveedor.
+    ///
+    /// Si el vinculo proveedor-articulo no existe todavia (nunca se compro por
+    /// SICAR), se crea con el precio dado; asi la proxima comparacion de
+    /// proveedores ya lo ve en las dos puntas.
+    /// </summary>
+    public async Task<object> UpdateSupplierProductPriceAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+        var proId = payload.GetProperty("proId").GetInt32();
+        var precio = payload.GetProperty("precioCompra").GetDecimal();
+        if (precio < 0)
+        {
+            throw new InvalidOperationException("precioCompra no puede ser negativo");
+        }
+
+        await using var conn = await OpenAsync(db, ct);
+        var artId = await ResolveArtIdAsync(payload, conn, ct);
+
+        // Verificar que el proveedor exista (mensaje claro si el codigo vino mal).
+        await using (var check = new MySqlCommand(
+            "SELECT COUNT(*) FROM proveedor WHERE pro_id = @proId", conn))
+        {
+            check.Parameters.AddWithValue("@proId", proId);
+            var existe = Convert.ToInt32(await check.ExecuteScalarAsync(ct));
+            if (existe == 0)
+            {
+                throw new InvalidOperationException(
+                    $"El proveedor {proId} no existe en SICAR.");
+            }
+        }
+
+        await using var upd = new MySqlCommand(
+            "UPDATE proveedorarticulo SET precioCompra = @precio, fecha = NOW() " +
+            "WHERE art_id = @artId AND pro_id = @proId",
+            conn);
+        upd.Parameters.AddWithValue("@precio", precio);
+        upd.Parameters.AddWithValue("@artId", artId);
+        upd.Parameters.AddWithValue("@proId", proId);
+        var rows = await upd.ExecuteNonQueryAsync(ct);
+
+        var created = false;
+        if (rows == 0)
+        {
+            await using var ins = new MySqlCommand(
+                "INSERT INTO proveedorarticulo (pro_id, art_id, claveProveedor, precioCompra, fecha) " +
+                "VALUES (@proId, @artId, '', @precio, NOW())",
+                conn);
+            ins.Parameters.AddWithValue("@proId", proId);
+            ins.Parameters.AddWithValue("@artId", artId);
+            ins.Parameters.AddWithValue("@precio", precio);
+            rows = await ins.ExecuteNonQueryAsync(ct);
+            created = true;
+        }
+
+        _logger.LogInformation(
+            "UPDATE_SUPPLIER_PRODUCT_PRICE db={Db} art_id={ArtId} pro_id={ProId} precio={Precio} created={Created}",
+            db, artId, proId, precio, created);
+
+        return new { artId, proId, precioCompra = precio, created, rowsAffected = rows };
+    }
+
+    /// <summary>
+    /// Version masiva de UPDATE_SUPPLIER_PRODUCT_PRICE: un solo comando para
+    /// cambiar el precio de compra de MUCHOS articulos para UN proveedor
+    /// (cambio por categoria). Resiliente por item, igual que BulkUpdatePrice:
+    /// el que falle se reporta en failed y sigue con el resto.
+    ///
+    /// Payload: { databaseName, proId, items: [{ clave, precioCompra }] }
+    /// Devuelve: { updated, failed: [{ clave, reason }] }
+    /// </summary>
+    public async Task<object> BulkUpdateSupplierProductPriceAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+        var proId = payload.GetProperty("proId").GetInt32();
+        if (!payload.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array)
+        {
+            throw new InvalidOperationException("payload.items (array) es requerido");
+        }
+
+        await using var conn = await OpenAsync(db, ct);
+
+        await using (var check = new MySqlCommand(
+            "SELECT COUNT(*) FROM proveedor WHERE pro_id = @proId", conn))
+        {
+            check.Parameters.AddWithValue("@proId", proId);
+            var existe = Convert.ToInt32(await check.ExecuteScalarAsync(ct));
+            if (existe == 0)
+            {
+                throw new InvalidOperationException($"El proveedor {proId} no existe en SICAR.");
+            }
+        }
+
+        var updated = 0;
+        var failed = new List<object>();
+
+        foreach (var item in items.EnumerateArray())
+        {
+            var clave = GetOptionalString(item, "clave") ?? "";
+            if (string.IsNullOrWhiteSpace(clave))
+            {
+                failed.Add(new { clave, reason = "clave vacía" });
+                continue;
+            }
+
+            try
+            {
+                var precio = item.GetProperty("precioCompra").GetDecimal();
+                if (precio < 0)
+                {
+                    failed.Add(new { clave, reason = "precio negativo" });
+                    continue;
+                }
+
+                int artId;
+                await using (var idCmd = new MySqlCommand(
+                    "SELECT art_id FROM articulo WHERE clave = @c LIMIT 1", conn))
+                {
+                    idCmd.Parameters.AddWithValue("@c", clave);
+                    var result = await idCmd.ExecuteScalarAsync(ct);
+                    if (result == null || result == DBNull.Value)
+                    {
+                        failed.Add(new { clave, reason = "no existe en SICAR" });
+                        continue;
+                    }
+                    artId = Convert.ToInt32(result);
+                }
+
+                await using var upd = new MySqlCommand(
+                    "UPDATE proveedorarticulo SET precioCompra = @precio, fecha = NOW() " +
+                    "WHERE art_id = @artId AND pro_id = @proId",
+                    conn);
+                upd.Parameters.AddWithValue("@precio", precio);
+                upd.Parameters.AddWithValue("@artId", artId);
+                upd.Parameters.AddWithValue("@proId", proId);
+                var rows = await upd.ExecuteNonQueryAsync(ct);
+
+                if (rows == 0)
+                {
+                    // El back solo manda productos con vinculo local; si SICAR no
+                    // lo tiene (desfase del espejo), se crea para mantener las dos
+                    // puntas iguales, como en la version unitaria.
+                    await using var ins = new MySqlCommand(
+                        "INSERT INTO proveedorarticulo (pro_id, art_id, claveProveedor, precioCompra, fecha) " +
+                        "VALUES (@proId, @artId, '', @precio, NOW())",
+                        conn);
+                    ins.Parameters.AddWithValue("@proId", proId);
+                    ins.Parameters.AddWithValue("@artId", artId);
+                    ins.Parameters.AddWithValue("@precio", precio);
+                    await ins.ExecuteNonQueryAsync(ct);
+                }
+                updated++;
+            }
+            catch (Exception ex)
+            {
+                failed.Add(new { clave, reason = ex.Message });
+            }
+        }
+
+        _logger.LogInformation(
+            "BULK_UPDATE_SUPPLIER_PRODUCT_PRICE db={Db} pro_id={ProId} updated={Updated} failed={Failed}",
+            db, proId, updated, failed.Count);
+
+        return new { updated, failed };
+    }
+
     public async Task<object> UpdateMinMaxAsync(JsonElement payload, CancellationToken ct)
     {
         var db = RequireDatabaseName(payload);

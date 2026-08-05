@@ -38,6 +38,8 @@ public class CommandDispatcher
                 "ADJUST_STOCK" => CommandResult.Ok(await _sicar.AdjustStockAsync(payload, ct)),
                 "BULK_ADJUST_STOCK" => CommandResult.Ok(await _sicar.BulkAdjustStockAsync(payload, ct)),
                 "UPDATE_PRICE" => CommandResult.Ok(await _sicar.UpdatePriceAsync(payload, ct)),
+                "UPDATE_SUPPLIER_PRODUCT_PRICE" => CommandResult.Ok(await _sicar.UpdateSupplierProductPriceAsync(payload, ct)),
+                "BULK_UPDATE_SUPPLIER_PRODUCT_PRICE" => CommandResult.Ok(await _sicar.BulkUpdateSupplierProductPriceAsync(payload, ct)),
                 "BULK_UPDATE_PRICE" => CommandResult.Ok(await _sicar.BulkUpdatePriceAsync(payload, ct)),
                 "UPDATE_MIN_MAX" => CommandResult.Ok(await _sicar.UpdateMinMaxAsync(payload, ct)),
                 "BULK_UPDATE_MIN_MAX" => CommandResult.Ok(await _sicar.BulkUpdateMinMaxAsync(payload, ct)),

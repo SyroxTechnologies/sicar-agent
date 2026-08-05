@@ -56,6 +56,8 @@ public interface ISicarAdapter
     Task<object> AdjustStockAsync(JsonElement payload, CancellationToken ct);
     Task<object> BulkAdjustStockAsync(JsonElement payload, CancellationToken ct);
     Task<object> UpdatePriceAsync(JsonElement payload, CancellationToken ct);
+    Task<object> UpdateSupplierProductPriceAsync(JsonElement payload, CancellationToken ct);
+    Task<object> BulkUpdateSupplierProductPriceAsync(JsonElement payload, CancellationToken ct);
     Task<object> UpdateMinMaxAsync(JsonElement payload, CancellationToken ct);
     Task<object> BulkUpdateMinMaxAsync(JsonElement payload, CancellationToken ct);
     Task<object> TransferStockAsync(JsonElement payload, CancellationToken ct);
