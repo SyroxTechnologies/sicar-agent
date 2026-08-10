@@ -376,46 +376,95 @@ public class SicarAdapter : ISicarAdapter
             throw new InvalidOperationException("SYNC_STOCK_HISTORY requiere 'from' y 'to' (formato yyyy-MM-dd)");
         }
 
+        if (!DateTime.TryParse(from, out var desde))
+        {
+            throw new InvalidOperationException($"SYNC_STOCK_HISTORY: 'from' invalido ({from})");
+        }
+
         await using var conn = await OpenAsync(db, ct);
         var changes = new List<Dictionary<string, object?>>();
 
-        // Estrategia comprimida: SICAR guarda una foto diaria de la existencia de
-        // cada articulo (inventariofecha tipo=1 + inventariofechaarticulo). En vez
-        // de transferir la foto completa, se emite una fila SOLO cuando la
-        // existencia cambia respecto al dia anterior (LAG). El rango arranca desde
-        // la foto inmediatamente anterior a @from (el ancla) para que el primer dia
-        // del rango se compare contra su valor real y no genere un cambio falso;
-        // luego se filtran las filas para devolver solo las que caen dentro de
-        // [from, to). Esto tambien hace funcionar el delta diario (1 solo dia).
+        // SICAR guarda una foto diaria de la existencia de cada articulo
+        // (inventariofecha tipo=1 + inventariofechaarticulo). Solo interesa
+        // cuando la existencia CAMBIA respecto de la foto anterior del mismo
+        // articulo, asi que el resto se descarta.
+        //
+        // Ese delta se calcula acá y no en SQL, a proposito. Las tres formas de
+        // hacerlo en el servidor tienen su problema contra SICAR real:
+        //
+        //   - LAG() OVER (PARTITION BY ...) necesita MySQL 8.0 y las
+        //     instalaciones de SICAR corren 5.6: rompe con error de sintaxis.
+        //   - Emularlo con variables de usuario obliga a ordenar dentro de una
+        //     subconsulta; MySQL 5.6 la materializa, pierde el indice y la
+        //     consulta pasa de 2 segundos a mas de 5 minutos.
+        //   - Un subquery correlacionado por fila es peor todavia.
+        //
+        // La consulta de abajo ordena por (art_id, fecha), que SI usa indice
+        // (PRIMARY es (inf_id, art_id) y hay un indice por art_id), y tarda ~2
+        // segundos para un mes. La contra es que viajan todas las fotos del
+        // periodo en vez de solo los cambios; se procesan en streaming, sin
+        // acumularlas en memoria, y a cambio la base del cliente hace una
+        // consulta liviana en vez de una que la tenga cinco minutos ocupada.
+        //
+        // El rango arranca en la foto inmediatamente anterior a `from` (el
+        // ancla) para que el primer dia se compare contra su valor real y no
+        // genere un cambio falso. Esa fila se usa para comparar pero no se
+        // emite: por eso el filtro por `ts >= from` es sobre la salida.
         const string sql = @"
-            SELECT clave, dia, existencia FROM (
-                SELECT ifa.clave AS clave,
-                       DATE(f.fecha) AS dia,
-                       f.fecha AS ts,
-                       ifa.existencia AS existencia,
-                       LAG(ifa.existencia) OVER (PARTITION BY ifa.clave ORDER BY f.fecha) AS prev
-                FROM inventariofechaarticulo ifa
-                JOIN inventariofecha f ON f.inf_id = ifa.inf_id
-                WHERE f.tipo = 1
-                  AND f.fecha >= COALESCE(
-                      (SELECT MAX(f2.fecha) FROM inventariofecha f2 WHERE f2.tipo = 1 AND f2.fecha < @from),
-                      @from)
-                  AND f.fecha < @to
-            ) t
-            WHERE t.ts >= @from AND (t.prev IS NULL OR t.existencia <> t.prev)
-            ORDER BY clave, dia";
+            SELECT ifa.art_id AS art_id,
+                   ifa.clave AS clave,
+                   DATE(f.fecha) AS dia,
+                   f.fecha AS ts,
+                   ifa.existencia AS existencia
+            FROM inventariofechaarticulo ifa
+            JOIN inventariofecha f ON f.inf_id = ifa.inf_id
+            WHERE f.tipo = 1
+              AND f.fecha >= COALESCE(
+                  (SELECT MAX(f2.fecha) FROM inventariofecha f2 WHERE f2.tipo = 1 AND f2.fecha < @from),
+                  @from)
+              AND f.fecha < @to
+            ORDER BY ifa.art_id, f.fecha";
 
         await using var cmd = new MySqlCommand(sql, conn);
         cmd.Parameters.AddWithValue("@from", from);
         cmd.Parameters.AddWithValue("@to", to);
         await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+        // Arrastre del articulo anterior: emula la particion de LAG.
+        object? articuloAnterior = null;
+        decimal? existenciaAnterior = null;
+        var leidas = 0;
+
         while (await reader.ReadAsync(ct))
         {
-            changes.Add(ReadRow(reader));
+            leidas++;
+            var artId = reader["art_id"];
+            var existencia = reader.GetDecimal(reader.GetOrdinal("existencia"));
+            var ts = reader.GetDateTime(reader.GetOrdinal("ts"));
+
+            var esOtroArticulo = articuloAnterior is null || !articuloAnterior.Equals(artId);
+            // Primera foto del articulo dentro de la ventana leida: no hay con
+            // que comparar, asi que cuenta como cambio (igual que LAG con prev
+            // en NULL).
+            var cambio = esOtroArticulo || existenciaAnterior != existencia;
+
+            if (cambio && ts >= desde)
+            {
+                changes.Add(new Dictionary<string, object?>
+                {
+                    ["clave"] = reader["clave"],
+                    ["dia"] = reader["dia"],
+                    ["existencia"] = existencia,
+                });
+            }
+
+            articuloAnterior = artId;
+            existenciaAnterior = existencia;
         }
 
         _logger.LogInformation(
-            "SYNC_STOCK_HISTORY db={Db} from={From} to={To} rows={Rows}", db, from, to, changes.Count);
+            "SYNC_STOCK_HISTORY db={Db} from={From} to={To} fotos={Leidas} cambios={Rows}",
+            db, from, to, leidas, changes.Count);
         return new { database = db, from, to, syncedCount = changes.Count, changes };
     }
 
