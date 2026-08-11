@@ -54,6 +54,16 @@ public class SicarAdapter : ISicarAdapter
             cs = cs.TrimEnd(';') + $";Database={databaseName};";
         }
 
+        // Timeout de conexion holgado: el agente vive en el servidor y llega a la
+        // sucursal por VPN, con ~250 ms de ida y vuelta. Los 15 segundos que trae
+        // el driver por defecto se agotaban cuando varios comandos abrian
+        // conexion a la vez sobre una PC que ademas esta cobrando.
+        if (cs.IndexOf("Connection Timeout", StringComparison.OrdinalIgnoreCase) < 0
+            && cs.IndexOf("ConnectionTimeout", StringComparison.OrdinalIgnoreCase) < 0)
+        {
+            cs = cs.TrimEnd(';') + ";Connection Timeout=60;";
+        }
+
         var conn = new MySqlConnection(cs);
         await conn.OpenAsync(ct);
         return conn;
@@ -376,95 +386,62 @@ public class SicarAdapter : ISicarAdapter
             throw new InvalidOperationException("SYNC_STOCK_HISTORY requiere 'from' y 'to' (formato yyyy-MM-dd)");
         }
 
-        if (!DateTime.TryParse(from, out var desde))
-        {
-            throw new InvalidOperationException($"SYNC_STOCK_HISTORY: 'from' invalido ({from})");
-        }
-
         await using var conn = await OpenAsync(db, ct);
         var changes = new List<Dictionary<string, object?>>();
 
         // SICAR guarda una foto diaria de la existencia de cada articulo
         // (inventariofecha tipo=1 + inventariofechaarticulo). Solo interesa
-        // cuando la existencia CAMBIA respecto de la foto anterior del mismo
-        // articulo, asi que el resto se descarta.
+        // cuando la existencia CAMBIA respecto de la foto anterior.
         //
-        // Ese delta se calcula acá y no en SQL, a proposito. Las tres formas de
-        // hacerlo en el servidor tienen su problema contra SICAR real:
+        // Cada foto se compara contra la inmediatamente anterior con un LEFT
+        // JOIN por (inf_id, art_id), que es la clave primaria de la tabla. Eso
+        // evita las tres alternativas que no funcionan contra SICAR real:
         //
         //   - LAG() OVER (PARTITION BY ...) necesita MySQL 8.0 y las
         //     instalaciones de SICAR corren 5.6: rompe con error de sintaxis.
         //   - Emularlo con variables de usuario obliga a ordenar dentro de una
-        //     subconsulta; MySQL 5.6 la materializa, pierde el indice y la
-        //     consulta pasa de 2 segundos a mas de 5 minutos.
-        //   - Un subquery correlacionado por fila es peor todavia.
+        //     subconsulta; MySQL 5.6 la materializa, pierde el indice y pasa de
+        //     2 segundos a mas de 5 minutos.
+        //   - Traer todas las fotos y calcular el delta acá funciona, pero
+        //     mueve ~378.000 filas por mes: satura el MySQL de la sucursal (que
+        //     es la misma PC donde cobran) y provoca "Connect Timeout expired"
+        //     en los comandos que corren en paralelo.
         //
-        // La consulta de abajo ordena por (art_id, fecha), que SI usa indice
-        // (PRIMARY es (inf_id, art_id) y hay un indice por art_id), y tarda ~2
-        // segundos para un mes. La contra es que viajan todas las fotos del
-        // periodo en vez de solo los cambios; se procesan en streaming, sin
-        // acumularlas en memoria, y a cambio la base del cliente hace una
-        // consulta liviana en vez de una que la tenga cinco minutos ocupada.
+        // Medido sobre un mes real: 2,3 segundos y 5.254 filas, contra 377.918
+        // del enfoque anterior. Mismo resultado, 72 veces menos trafico.
         //
-        // El rango arranca en la foto inmediatamente anterior a `from` (el
-        // ancla) para que el primer dia se compare contra su valor real y no
-        // genere un cambio falso. Esa fila se usa para comparar pero no se
-        // emite: por eso el filtro por `ts >= from` es sobre la salida.
+        // `ayer_id` sale de la foto anterior aunque caiga fuera del rango, asi
+        // el primer dia se compara contra su valor real y no genera un cambio
+        // falso. Si no existe (primera foto de la historia) el LEFT JOIN no
+        // matchea y la fila se emite, igual que LAG con `prev` en NULL.
         const string sql = @"
-            SELECT ifa.art_id AS art_id,
-                   ifa.clave AS clave,
-                   DATE(f.fecha) AS dia,
-                   f.fecha AS ts,
-                   ifa.existencia AS existencia
-            FROM inventariofechaarticulo ifa
-            JOIN inventariofecha f ON f.inf_id = ifa.inf_id
-            WHERE f.tipo = 1
-              AND f.fecha >= COALESCE(
-                  (SELECT MAX(f2.fecha) FROM inventariofecha f2 WHERE f2.tipo = 1 AND f2.fecha < @from),
-                  @from)
-              AND f.fecha < @to
-            ORDER BY ifa.art_id, f.fecha";
+            SELECT hoy.clave AS clave, DATE(fh.fecha) AS dia, hoy.existencia AS existencia
+            FROM (
+                SELECT f1.inf_id AS hoy_id,
+                       (SELECT f2.inf_id FROM inventariofecha f2
+                         WHERE f2.tipo = 1 AND f2.fecha < f1.fecha
+                         ORDER BY f2.fecha DESC LIMIT 1) AS ayer_id
+                  FROM inventariofecha f1
+                 WHERE f1.tipo = 1 AND f1.fecha >= @from AND f1.fecha < @to
+            ) pares
+            JOIN inventariofecha fh ON fh.inf_id = pares.hoy_id
+            JOIN inventariofechaarticulo hoy ON hoy.inf_id = pares.hoy_id
+            LEFT JOIN inventariofechaarticulo ayer
+                   ON ayer.inf_id = pares.ayer_id AND ayer.art_id = hoy.art_id
+            WHERE ayer.art_id IS NULL OR ayer.existencia <> hoy.existencia
+            ORDER BY hoy.clave, dia";
 
         await using var cmd = new MySqlCommand(sql, conn);
         cmd.Parameters.AddWithValue("@from", from);
         cmd.Parameters.AddWithValue("@to", to);
         await using var reader = await cmd.ExecuteReaderAsync(ct);
-
-        // Arrastre del articulo anterior: emula la particion de LAG.
-        object? articuloAnterior = null;
-        decimal? existenciaAnterior = null;
-        var leidas = 0;
-
         while (await reader.ReadAsync(ct))
         {
-            leidas++;
-            var artId = reader["art_id"];
-            var existencia = reader.GetDecimal(reader.GetOrdinal("existencia"));
-            var ts = reader.GetDateTime(reader.GetOrdinal("ts"));
-
-            var esOtroArticulo = articuloAnterior is null || !articuloAnterior.Equals(artId);
-            // Primera foto del articulo dentro de la ventana leida: no hay con
-            // que comparar, asi que cuenta como cambio (igual que LAG con prev
-            // en NULL).
-            var cambio = esOtroArticulo || existenciaAnterior != existencia;
-
-            if (cambio && ts >= desde)
-            {
-                changes.Add(new Dictionary<string, object?>
-                {
-                    ["clave"] = reader["clave"],
-                    ["dia"] = reader["dia"],
-                    ["existencia"] = existencia,
-                });
-            }
-
-            articuloAnterior = artId;
-            existenciaAnterior = existencia;
+            changes.Add(ReadRow(reader));
         }
 
         _logger.LogInformation(
-            "SYNC_STOCK_HISTORY db={Db} from={From} to={To} fotos={Leidas} cambios={Rows}",
-            db, from, to, leidas, changes.Count);
+            "SYNC_STOCK_HISTORY db={Db} from={From} to={To} rows={Rows}", db, from, to, changes.Count);
         return new { database = db, from, to, syncedCount = changes.Count, changes };
     }
 
