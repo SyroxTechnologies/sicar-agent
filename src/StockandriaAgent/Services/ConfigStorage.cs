@@ -96,13 +96,29 @@ public class ConfigStorage : IConfigStorage
         return Encoding.UTF8.GetString(cipher);
     }
 
+    /// <summary>
+    /// Aviso de que la config queda sin cifrar.
+    /// </summary>
+    /// <remarks>
+    /// Antes decia "MODO DEV: no usar en produccion", y eso confundia: desde que
+    /// los agentes corren en contenedores Linux en el servidor, este es el modo
+    /// normal, no un descuido. DPAPI existe solo en Windows y no hay equivalente
+    /// directo en Linux.
+    ///
+    /// Lo que protege el archivo son los permisos (0600 el archivo, 0700 la
+    /// carpeta) y el usuario sin privilegios del contenedor. Cifrarlo no sumaria
+    /// gran cosa igual: las mismas credenciales llegan como variables de entorno,
+    /// asi que quien pueda leer el archivo tambien puede verlas con `docker
+    /// inspect`. La barrera real es el acceso al host.
+    /// </remarks>
     private void LogDevModeWarningOnce()
     {
         if (_devModeWarningLogged) return;
         _devModeWarningLogged = true;
         _logger.LogWarning(
-            "⚠️  MODO DEV: ConfigStorage usa plaintext (OS {Os}, DPAPI solo en Windows). " +
-            "No usar en producción — solo desarrollo local.",
+            "Config del agente sin cifrar: DPAPI solo existe en Windows (OS {Os}). " +
+            "El archivo queda con permisos 0600 y lo lee unicamente el usuario del agente. " +
+            "En contenedor es lo esperado; proteger el acceso al host.",
             RuntimeInformation.OSDescription);
     }
 
