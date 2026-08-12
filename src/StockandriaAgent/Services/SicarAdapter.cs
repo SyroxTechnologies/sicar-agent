@@ -202,10 +202,19 @@ public class SicarAdapter : ISicarAdapter
 
         // Demanda real: solo ventas al cliente (status = 1) y se excluyen las
         // ventas por ajuste de inventario (ventaPorAjuste = 1). Se agrega por
-        // clave (SKU) + dia en el propio SQL para no transferir las lineas
-        // crudas. La sucursal es la base de datos, no hay columna de sucursal.
+        // producto + dia en el propio SQL para no transferir las lineas crudas.
+        // La sucursal es la base de datos, no hay columna de sucursal.
+        //
+        // Se manda `art_id` ademas de `clave` porque SICAR deja cambiar la clave
+        // de un articulo sin tocar su art_id: las ventas viejas conservan la
+        // clave anterior y, si el back cruza solo por SKU, ese pedazo de
+        // historia queda sin dueño. En mirasierra eran 54 productos activos con
+        // el historial partido, y el motor de demanda les calculaba un maximo
+        // mas bajo del real. El art_id es la identidad estable (es el mismo que
+        // viaja en SYNC_PRODUCTS y que el back guarda como `sicar_code`).
         const string sql = @"
-            SELECT d.clave AS clave,
+            SELECT d.art_id AS artId,
+                   d.clave AS clave,
                    DATE(v.fecha) AS dia,
                    SUM(d.cantidad) AS unidades,
                    SUM(d.importeCon) AS ingreso,
@@ -216,7 +225,7 @@ public class SicarAdapter : ISicarAdapter
               AND v.ventaPorAjuste = 0
               AND v.fecha >= @from
               AND v.fecha < @to
-            GROUP BY d.clave, DATE(v.fecha)";
+            GROUP BY d.art_id, d.clave, DATE(v.fecha)";
 
         await using (var cmd = new MySqlCommand(sql, conn))
         {
@@ -328,9 +337,12 @@ public class SicarAdapter : ISicarAdapter
             }
         }
 
+        // `art_id` viaja junto a la clave por el mismo motivo que en la query de
+        // ventas por producto: sobrevive a los cambios de clave.
         var productSellerSummary = new List<Dictionary<string, object?>>();
         const string productSellerSql = @"
-            SELECT d.clave AS clave,
+            SELECT d.art_id AS artId,
+                   d.clave AS clave,
                    DATE(v.fecha) AS dia,
                    COALESCE(v.vnd_id, 0) AS vendedorId,
                    COALESCE(vd.nombre, '') AS vendedor,
@@ -344,7 +356,7 @@ public class SicarAdapter : ISicarAdapter
               AND v.ventaPorAjuste = 0
               AND v.fecha >= @from
               AND v.fecha < @to
-            GROUP BY d.clave, DATE(v.fecha), COALESCE(v.vnd_id, 0), COALESCE(vd.nombre, '')";
+            GROUP BY d.art_id, d.clave, DATE(v.fecha), COALESCE(v.vnd_id, 0), COALESCE(vd.nombre, '')";
 
         await using (var cmdProductSeller = new MySqlCommand(productSellerSql, conn))
         {
@@ -414,8 +426,11 @@ public class SicarAdapter : ISicarAdapter
         // el primer dia se compara contra su valor real y no genera un cambio
         // falso. Si no existe (primera foto de la historia) el LEFT JOIN no
         // matchea y la fila se emite, igual que LAG con `prev` en NULL.
+        // `art_id` viaja junto a la clave por el mismo motivo que en SYNC_SALES:
+        // es la identidad estable del articulo y sobrevive a los cambios de
+        // clave que SICAR permite hacer.
         const string sql = @"
-            SELECT hoy.clave AS clave, DATE(fh.fecha) AS dia, hoy.existencia AS existencia
+            SELECT hoy.art_id AS artId, hoy.clave AS clave, DATE(fh.fecha) AS dia, hoy.existencia AS existencia
             FROM (
                 SELECT f1.inf_id AS hoy_id,
                        (SELECT f2.inf_id FROM inventariofecha f2
@@ -465,8 +480,14 @@ public class SicarAdapter : ISicarAdapter
         // importeSin / (cantidad * factor): robusto aunque se compre por caja.
         // Si el mismo dia hubo varias compras del articulo se promedia ponderado
         // (SUM importe / SUM piezas). Solo compras aplicadas (status = 1).
+        //
+        // `art_id` viaja junto a la clave: en Narciso, 345 de 22.965 lineas de
+        // compra tenian una clave que ya no corresponde a ningun articulo activo
+        // (SICAR permite cambiar la clave sin tocar el art_id) y 166 se rescatan
+        // solo con el art_id.
         const string sql = @"
-            SELECT dc.clave AS clave,
+            SELECT dc.art_id AS artId,
+                   dc.clave AS clave,
                    DATE(c.fecha) AS dia,
                    SUM(dc.importeSin) AS importe,
                    SUM(dc.cantidad * dc.factor) AS piezas
@@ -475,7 +496,7 @@ public class SicarAdapter : ISicarAdapter
             WHERE c.status = 1
               AND c.fecha >= @from AND c.fecha < @to
               AND dc.cantidad > 0
-            GROUP BY dc.clave, DATE(c.fecha)
+            GROUP BY dc.art_id, dc.clave, DATE(c.fecha)
             HAVING SUM(dc.cantidad * dc.factor) > 0
             ORDER BY clave, dia";
 
