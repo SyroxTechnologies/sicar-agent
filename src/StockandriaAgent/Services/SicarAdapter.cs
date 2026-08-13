@@ -984,7 +984,9 @@ public class SicarAdapter : ISicarAdapter
         {
             foreach (var item in items.EnumerateArray())
             {
-                var artId = item.GetProperty("artId").GetInt32();
+                // Resuelve el art_id LOCAL por clave (el artId del payload es el
+                // de otra base SICAR y solo sirve de fallback; ver ResolveArtIdAsync).
+                var artId = await ResolveArtIdAsync(item, conn, ct, tx);
                 var cantidad = item.GetProperty("cantidad").GetInt32();
 
                 await using var cmd = new MySqlCommand(sql, conn, tx);
@@ -1599,8 +1601,10 @@ public class SicarAdapter : ISicarAdapter
 
         if (mode == "detail")
         {
-            var artId = payload.GetProperty("artId").GetInt32();
             await using var conn = await OpenAsync(db, ct);
+            // Por clave si viene (identifica el articulo en ESTA base); el artId
+            // del payload es de otra base SICAR y solo sirve de fallback.
+            var artId = await ResolveArtIdAsync(payload, conn, ct);
 
             // Mismas columnas que SyncProductsAsync para que el back pueda
             // reusar ProductSyncerService.applySingle() en el flujo refresh.
@@ -1727,8 +1731,9 @@ public class SicarAdapter : ISicarAdapter
 
         if (mode == "detail")
         {
-            var artId = payload.GetProperty("artId").GetInt32();
             await using var conn = await OpenAsync(db, ct);
+            // Por clave si viene; el artId es local por sucursal (solo fallback).
+            var artId = await ResolveArtIdAsync(payload, conn, ct);
 
             const string sql = @"
                 SELECT art_id, clave, descripcion, existencia, invMin, invMax
