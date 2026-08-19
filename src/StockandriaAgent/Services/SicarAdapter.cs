@@ -136,12 +136,19 @@ public class SicarAdapter : ISicarAdapter
         // Nota: la tabla `impuesto` viene vacía en los SICAR de prueba y la
         // columna del porcentaje varía según versión (`porcentaje`, `tasa`,
         // etc.). Devolvemos NULL para que el back aplique fallback 16%.
+        // El departamento viaja junto con la categoria (dep_id + nombre): en
+        // SICAR `categoria.dep_id` es NOT NULL, asi que el dato siempre esta.
+        // Sin el, el back creaba las categorias solo con el nombre y quedaban
+        // sin departamento hasta que corriera GET_CATEGORIES; las que nunca
+        // matcheaban quedaban huerfanas y no aparecian al armar un pedido.
         const string sql = @"
             SELECT a.art_id, a.clave, a.claveAlterna, a.caracteristicas, a.descripcion,
                    a.precio1, a.precio2, a.precio3, a.precio4,
                    a.precioCompra, a.existencia, a.invMin, a.invMax,
                    a.cat_id, a.status,
                    c.nombre AS categoria_nombre,
+                   c.dep_id AS departamento_id,
+                   d.nombre AS departamento_nombre,
                    u.nombre AS unidad_nombre,
                    NULL AS iva_porcentaje,
                    (SELECT pa.pro_id
@@ -150,6 +157,7 @@ public class SicarAdapter : ISicarAdapter
                     LIMIT 1) AS proveedor_pro_id
             FROM articulo a
             LEFT JOIN categoria c ON c.cat_id = a.cat_id
+            LEFT JOIN departamento d ON d.dep_id = c.dep_id
             LEFT JOIN unidad u ON u.uni_id = a.unidadVenta";
 
         await using var cmd = new MySqlCommand(sql, conn);
