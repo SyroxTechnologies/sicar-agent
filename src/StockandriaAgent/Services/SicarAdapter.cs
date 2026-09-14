@@ -1561,10 +1561,21 @@ public class SicarAdapter : ISicarAdapter
         return new { proId, yaExistia = false };
     }
 
+    /// <summary>
+    /// Payload: { databaseName, rfc?, nombre?, proId?, fields }
+    ///
+    /// El proveedor se identifica en ESTA base por su RFC o su nombre (ver
+    /// <see cref="ResolveProIdAsync"/>): el pro_id es un autoincrement local de
+    /// cada base SICAR, asi que el que manda el backend puede ser de otro
+    /// proveedor en esta sucursal, o no existir.
+    ///
+    /// Si el proveedor no existe en esta base NO es un error: devuelve
+    /// { found = false } y el backend saltea la sucursal.
+    /// Devuelve: { found, proId, rowsAffected }
+    /// </summary>
     public async Task<object> UpdateSupplierAsync(JsonElement payload, CancellationToken ct)
     {
         var db = RequireDatabaseName(payload);
-        var proId = payload.GetProperty("proId").GetInt32();
         var fields = payload.GetProperty("fields");
 
         // Nombres REALES de las columnas de `proveedor`. No hay `direccion` ni
@@ -1589,13 +1600,20 @@ public class SicarAdapter : ISicarAdapter
         }
 
         await using var conn = await OpenAsync(db, ct);
+        var proId = await ResolveProIdAsync(payload, conn, ct);
+        if (proId == null)
+        {
+            _logger.LogInformation("UPDATE_SUPPLIER db={Db}: el proveedor no existe en esta base, se saltea", db);
+            return new { found = false, proId = (int?)null, rowsAffected = 0 };
+        }
+
         cmd.Connection = conn;
         cmd.CommandText = $"UPDATE proveedor SET {string.Join(", ", sets)} WHERE pro_id = @id";
-        cmd.Parameters.AddWithValue("@id", proId);
+        cmd.Parameters.AddWithValue("@id", proId.Value);
 
         var rows = await cmd.ExecuteNonQueryAsync(ct);
         _logger.LogInformation("UPDATE_SUPPLIER db={Db} pro_id={ProId} rows={Rows}", db, proId, rows);
-        return new { proId, rowsAffected = rows };
+        return new { found = true, proId = proId.Value, rowsAffected = rows };
     }
 
     // -------------------------------------------------------------------------
@@ -1880,8 +1898,17 @@ public class SicarAdapter : ISicarAdapter
 
         if (mode == "detail")
         {
-            var proId = payload.GetProperty("proId").GetInt32();
             await using var conn = await OpenAsync(db, ct);
+            // Por RFC o nombre si vienen (identifican al proveedor en ESTA base);
+            // el proId es de otra base SICAR y solo se usa si no viene nada mas.
+            var resuelto = await ResolveProIdAsync(payload, conn, ct);
+            if (resuelto == null)
+            {
+                // No existe en esta sucursal: no es un error, el backend prueba
+                // en otra o la saltea.
+                return new { found = false };
+            }
+            var proId = resuelto.Value;
 
             // Aliases consistentes con SyncSuppliersAsync para que el back
             // pueda reusar SupplierSyncerService.applySingle() con esta fila
@@ -2346,6 +2373,111 @@ public class SicarAdapter : ISicarAdapter
         }
 
         return payload.GetProperty("artId").GetInt32();
+    }
+
+    /// <summary>
+    /// Resuelve el pro_id del proveedor en ESTA base SICAR.
+    ///
+    /// El pro_id es un autoincrement local: el mismo proveedor tiene un id
+    /// distinto en cada sucursal, y en alguna directamente no existe. Usar el
+    /// pro_id que manda el backend (el de otra base) hacia que el UPDATE pisara
+    /// a OTRO proveedor, o que la sucursal respondiera "no encontrado" y se
+    /// cayera el guardado entero (reporte de Maru Belleza, 2026-09-14).
+    ///
+    /// Misma identidad que usa el sync del backend: RFC valido primero, nombre
+    /// despues. El backend solo manda el RFC si es valido y no generico.
+    ///
+    ///   - Sin rfc ni nombre en el payload (backend viejo): devuelve el proId.
+    ///   - Encontrado: devuelve el pro_id de esta base.
+    ///   - No existe: devuelve null.
+    ///   - Mas de un proveedor con esa identidad: error, no se adivina.
+    /// </summary>
+    private async Task<int?> ResolveProIdAsync(
+        JsonElement payload, MySqlConnection conn, CancellationToken ct)
+    {
+        var rfc = NormalizarRfc(GetOptionalString(payload, "rfc"));
+        var nombre = GetOptionalString(payload, "nombre")?.Trim();
+        if (string.IsNullOrEmpty(nombre)) nombre = null;
+
+        if (rfc == null && nombre == null)
+        {
+            return payload.GetProperty("proId").GetInt32();
+        }
+
+        // Mismo normalizado que el backend (sin espacios, guiones, puntos ni
+        // barras) para que un RFC capturado "ABC-010101-XY1" matchee igual.
+        const string rfcSql =
+            "UPPER(REPLACE(REPLACE(REPLACE(REPLACE(rfc, ' ', ''), '-', ''), '.', ''), '/', ''))";
+
+        if (rfc != null)
+        {
+            var porRfc = await BuscarProveedoresAsync(
+                conn, $"SELECT pro_id, status FROM proveedor WHERE {rfcSql} = @rfc",
+                ("@rfc", rfc), null, ct);
+            if (porRfc.Count > 1 && nombre != null)
+            {
+                // Dos proveedores con el mismo RFC: el nombre desempata.
+                porRfc = await BuscarProveedoresAsync(
+                    conn,
+                    $"SELECT pro_id, status FROM proveedor WHERE {rfcSql} = @rfc AND TRIM(nombre) = @nombre",
+                    ("@rfc", rfc), ("@nombre", nombre), ct);
+            }
+            var porRfcElegido = ElegirProveedor(porRfc, $"RFC {rfc}");
+            if (porRfcElegido != null) return porRfcElegido;
+        }
+
+        if (nombre != null)
+        {
+            // La collation de SICAR ya compara sin mayusculas ni acentos.
+            var porNombre = await BuscarProveedoresAsync(
+                conn, "SELECT pro_id, status FROM proveedor WHERE TRIM(nombre) = @nombre",
+                ("@nombre", nombre), null, ct);
+            return ElegirProveedor(porNombre, $"nombre '{nombre}'");
+        }
+
+        return null;
+    }
+
+    private static async Task<List<(int ProId, int Status)>> BuscarProveedoresAsync(
+        MySqlConnection conn,
+        string sql,
+        (string Name, object Value) p1,
+        (string Name, object Value)? p2,
+        CancellationToken ct)
+    {
+        var filas = new List<(int ProId, int Status)>();
+        await using var cmd = new MySqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue(p1.Name, p1.Value);
+        if (p2 != null) cmd.Parameters.AddWithValue(p2.Value.Name, p2.Value.Value);
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            filas.Add((Convert.ToInt32(reader["pro_id"]), Convert.ToInt32(reader["status"])));
+        }
+        return filas;
+    }
+
+    /// <summary>
+    /// De los proveedores que matchean, el unico activo; si no hay activos, el
+    /// unico que haya. Con mas de uno no se elige al azar: se avisa.
+    /// </summary>
+    private static int? ElegirProveedor(List<(int ProId, int Status)> filas, string identidad)
+    {
+        if (filas.Count == 0) return null;
+        var activos = filas.Where(f => f.Status == 1).ToList();
+        if (activos.Count == 1) return activos[0].ProId;
+        if (activos.Count == 0 && filas.Count == 1) return filas[0].ProId;
+        throw new InvalidOperationException(
+            $"Hay mas de un proveedor con {identidad} en esta base SICAR " +
+            $"(pro_id {string.Join(", ", filas.Select(f => f.ProId))}). Hay que dejar uno solo.");
+    }
+
+    private static string? NormalizarRfc(string? rfc)
+    {
+        if (string.IsNullOrWhiteSpace(rfc)) return null;
+        var limpio = new string(rfc.ToUpperInvariant()
+            .Where(c => c != ' ' && c != '-' && c != '.' && c != '/').ToArray());
+        return limpio.Length == 0 ? null : limpio;
     }
 
     private static string RequireDatabaseName(JsonElement payload)
