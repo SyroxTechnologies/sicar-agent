@@ -1138,6 +1138,37 @@ public class SicarAdapter : ISicarAdapter
                 ? mx.GetInt32()
                 : 0;
 
+        // Precios 2-4 y las cantidades desde las que aplica cada uno.
+        //
+        // Antes entraban todos en cero y se esperaba que UPDATE_PRICE los
+        // ajustara después. Pero ese update es otro comando, y si fallaba el
+        // artículo se quedaba en SICAR con el precio 1 y nada más: "sin precio
+        // de compra, sin márgenes, sin precio 2, sin máximo y mínimo, a pesar
+        // de que sí le había puesto" (reporte 2026-11-02). Lo que se sabe al
+        // momento del alta viaja EN el alta.
+        //
+        // Las cantidades (mayoreo1-4) no las escribía ningún comando: ni el
+        // alta, que las ponía en cero, ni UPDATE_PRICE, que solo toca precios.
+        decimal Precio(string nombre) =>
+            payload.TryGetProperty(nombre, out var v) && v.ValueKind == JsonValueKind.Number
+                ? v.GetDecimal()
+                : 0m;
+
+        var precio2 = Precio("precio2");
+        var precio3 = Precio("precio3");
+        var precio4 = Precio("precio4");
+        var mayoreo1 = Precio("mayoreo1");
+        var mayoreo2 = Precio("mayoreo2");
+        var mayoreo3 = Precio("mayoreo3");
+        var mayoreo4 = Precio("mayoreo4");
+
+        // SICAR guarda la utilidad por artículo y no la recalcula sola. Misma
+        // cuenta que UpdatePriceAsync: margen = (precio/costo - 1) * 100.
+        decimal Margen(decimal precioVenta) =>
+            precioCompra > 0m && precioVenta > 0m
+                ? (precioVenta / precioCompra - 1m) * 100m
+                : 0m;
+
         await using var conn = await OpenAsync(db, ct);
 
         // Resolver cat_id y uni_id por nombre. Si no existen, fallar con
@@ -1187,8 +1218,8 @@ public class SicarAdapter : ISicarAdapter
             }
         }
 
-        // Defaults conservadores: el editor extendido de Stockandria luego
-        // ajusta margen/mayoreo via UPDATE_PRICE.
+        // Lo que no se manda entra en cero, que es el default razonable para un
+        // producto sin esos niveles de precio cargados.
         const string sql = @"
             INSERT INTO articulo (
                 clave, claveAlterna, descripcion, servicio, localizacion,
@@ -1201,9 +1232,9 @@ public class SicarAdapter : ISicarAdapter
             ) VALUES (
                 @clave, @claveAlterna, @descripcion, FALSE, '',
                 @invMin, @invMax, 1.000, @precioCompra, @precioCompra,
-                0.000000, 0.000000, 0.000000, 0.000000,
-                @precio, 0.000000, 0.000000, 0.000000,
-                0.000, 0.000, 0.000, 0.000,
+                @margen1, @margen2, @margen3, @margen4,
+                @precio, @precio2, @precio3, @precio4,
+                @mayoreo1, @mayoreo2, @mayoreo3, @mayoreo4,
                 0.0000, @caracteristicas, '',
                 1, @unidadCompra, @unidadVenta, @catId
             );
@@ -1218,6 +1249,17 @@ public class SicarAdapter : ISicarAdapter
         cmd.Parameters.AddWithValue("@invMax", invMax);
         cmd.Parameters.AddWithValue("@precioCompra", precioCompra);
         cmd.Parameters.AddWithValue("@precio", precio);
+        cmd.Parameters.AddWithValue("@precio2", precio2);
+        cmd.Parameters.AddWithValue("@precio3", precio3);
+        cmd.Parameters.AddWithValue("@precio4", precio4);
+        cmd.Parameters.AddWithValue("@mayoreo1", mayoreo1);
+        cmd.Parameters.AddWithValue("@mayoreo2", mayoreo2);
+        cmd.Parameters.AddWithValue("@mayoreo3", mayoreo3);
+        cmd.Parameters.AddWithValue("@mayoreo4", mayoreo4);
+        cmd.Parameters.AddWithValue("@margen1", Margen(precio));
+        cmd.Parameters.AddWithValue("@margen2", Margen(precio2));
+        cmd.Parameters.AddWithValue("@margen3", Margen(precio3));
+        cmd.Parameters.AddWithValue("@margen4", Margen(precio4));
         // Unidad de compra y venta son la misma — la mayoría de los
         // productos del rubro se compran y venden en la misma unidad.
         cmd.Parameters.AddWithValue("@unidadCompra", uniId);
