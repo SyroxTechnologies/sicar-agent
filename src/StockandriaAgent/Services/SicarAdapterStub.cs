@@ -170,6 +170,9 @@ public class SicarAdapterStub : ISicarAdapter
     public Task<object> GetDepartmentsAsync(JsonElement payload, CancellationToken ct)
         => Task.FromResult<object>(new { departments = Array.Empty<object>() });
 
+    public Task<object> GetPromotionsAsync(JsonElement payload, CancellationToken ct)
+        => Task.FromResult<object>(new { promotions = Array.Empty<object>(), stub = true });
+
     public Task<object> GetSupplierCategoriesAsync(JsonElement payload, CancellationToken ct)
         => Task.FromResult<object>(new { rows = Array.Empty<object>() });
 

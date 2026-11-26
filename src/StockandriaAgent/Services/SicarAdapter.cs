@@ -2124,6 +2124,136 @@ public class SicarAdapter : ISicarAdapter
         return new { departments = rows };
     }
 
+    /// <summary>
+    /// Promociones VIGENTES de SICAR con a que aplican, para importarlas a
+    /// Stockandria. Solo lectura (SELECT).
+    ///
+    /// Vigente = <c>promocion.status = 1</c> y que no haya vencido (fechaFin
+    /// mayor o igual a hoy, con el reloj de esta PC). De <c>detallepromo</c> solo
+    /// los renglones activos (<c>status = 1</c>; -1 es un renglon borrado).
+    ///
+    /// Los articulos viajan con sus codigos (clave, claveAlterna,
+    /// caracteristicas) y las categorias/departamentos con su nombre: el
+    /// <c>art_id</c>, <c>cat_id</c> y <c>dep_id</c> son autoincrement de cada
+    /// base y no sirven para encontrarlos en Stockandria.
+    /// </summary>
+    public async Task<object> GetPromotionsAsync(JsonElement payload, CancellationToken ct)
+    {
+        var db = RequireDatabaseName(payload);
+        await using var conn = await OpenAsync(db, ct);
+
+        const string sqlPromos = @"
+            SELECT pro_id, nombre,
+                   DATE_FORMAT(fechaIni, '%Y-%m-%d') AS fechaIni,
+                   DATE_FORMAT(fechaFin, '%Y-%m-%d') AS fechaFin,
+                   descuento, pago, salida, precio, piezasMin, piezasReq, piezasPromo,
+                   totalMin, condicion, cascada, mixto, artReq, clientes, hor_id
+            FROM promocion
+            WHERE status = 1 AND fechaFin >= CURDATE()
+            ORDER BY pro_id ASC";
+
+        const string sqlDetalles = @"
+            SELECT d.pro_id, d.tipo, d.art_id, a.clave, a.claveAlterna, a.caracteristicas,
+                   d.cat_id, c.nombre AS categoria, d.dep_id, dp.nombre AS departamento
+            FROM detallepromo d
+            JOIN promocion p ON p.pro_id = d.pro_id
+            LEFT JOIN articulo a ON a.art_id = d.art_id
+            LEFT JOIN categoria c ON c.cat_id = d.cat_id
+            LEFT JOIN departamento dp ON dp.dep_id = d.dep_id
+            WHERE d.status = 1 AND p.status = 1 AND p.fechaFin >= CURDATE()
+            ORDER BY d.pro_id ASC, d.dpr_id ASC";
+
+        var detallesPorPromo = new Dictionary<int, List<object>>();
+        await using (var cmd = new MySqlCommand(sqlDetalles, conn))
+        await using (var reader = await cmd.ExecuteReaderAsync(ct))
+        {
+            while (await reader.ReadAsync(ct))
+            {
+                var proId = Convert.ToInt32(reader.GetValue(reader.GetOrdinal("pro_id")));
+                if (!detallesPorPromo.TryGetValue(proId, out var lista))
+                {
+                    lista = new List<object>();
+                    detallesPorPromo[proId] = lista;
+                }
+                lista.Add(new
+                {
+                    tipo = Convert.ToInt32(reader.GetValue(reader.GetOrdinal("tipo"))),
+                    artId = LeerEntero(reader, "art_id"),
+                    clave = LeerTexto(reader, "clave"),
+                    claveAlterna = LeerTexto(reader, "claveAlterna"),
+                    caracteristicas = LeerTexto(reader, "caracteristicas"),
+                    catId = LeerEntero(reader, "cat_id"),
+                    categoria = LeerTexto(reader, "categoria"),
+                    depId = LeerEntero(reader, "dep_id"),
+                    departamento = LeerTexto(reader, "departamento"),
+                });
+            }
+        }
+
+        var promos = new List<object>();
+        await using (var cmd = new MySqlCommand(sqlPromos, conn))
+        await using (var reader = await cmd.ExecuteReaderAsync(ct))
+        {
+            while (await reader.ReadAsync(ct))
+            {
+                var proId = Convert.ToInt32(reader.GetValue(reader.GetOrdinal("pro_id")));
+                promos.Add(new
+                {
+                    proId,
+                    nombre = LeerTexto(reader, "nombre") ?? "",
+                    fechaIni = LeerTexto(reader, "fechaIni") ?? "",
+                    fechaFin = LeerTexto(reader, "fechaFin") ?? "",
+                    descuento = LeerDecimal(reader, "descuento"),
+                    pago = LeerEntero(reader, "pago"),
+                    salida = LeerEntero(reader, "salida"),
+                    precio = LeerEntero(reader, "precio"),
+                    piezasMin = LeerEntero(reader, "piezasMin"),
+                    piezasReq = LeerEntero(reader, "piezasReq"),
+                    piezasPromo = LeerEntero(reader, "piezasPromo"),
+                    totalMin = LeerDecimal(reader, "totalMin"),
+                    condicion = LeerBooleano(reader, "condicion"),
+                    cascada = LeerBooleano(reader, "cascada"),
+                    mixto = LeerBooleano(reader, "mixto"),
+                    artReq = LeerBooleano(reader, "artReq"),
+                    clientes = LeerBooleano(reader, "clientes"),
+                    horId = LeerEntero(reader, "hor_id"),
+                    detalles = detallesPorPromo.TryGetValue(proId, out var d) ? d : new List<object>(),
+                });
+            }
+        }
+
+        _logger.LogInformation(
+            "GET_PROMOTIONS db={Db} promociones={Promos} renglones={Detalles}",
+            db, promos.Count, detallesPorPromo.Values.Sum(l => l.Count));
+
+        return new { database = db, promotions = promos };
+    }
+
+    private static int? LeerEntero(MySqlDataReader reader, string columna)
+    {
+        var i = reader.GetOrdinal(columna);
+        return reader.IsDBNull(i) ? null : Convert.ToInt32(reader.GetValue(i));
+    }
+
+    private static decimal? LeerDecimal(MySqlDataReader reader, string columna)
+    {
+        var i = reader.GetOrdinal(columna);
+        return reader.IsDBNull(i) ? null : Convert.ToDecimal(reader.GetValue(i));
+    }
+
+    private static string? LeerTexto(MySqlDataReader reader, string columna)
+    {
+        var i = reader.GetOrdinal(columna);
+        return reader.IsDBNull(i) ? null : Convert.ToString(reader.GetValue(i));
+    }
+
+    /// <summary>tinyint(1) llega como bool o como numero segun la conexion: se aceptan los dos.</summary>
+    private static bool LeerBooleano(MySqlDataReader reader, string columna)
+    {
+        var i = reader.GetOrdinal(columna);
+        return !reader.IsDBNull(i) && Convert.ToInt32(reader.GetValue(i)) != 0;
+    }
+
     public async Task<object> GetSupplierCategoriesAsync(JsonElement payload, CancellationToken ct)
     {
         var db = RequireDatabaseName(payload);

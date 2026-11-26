@@ -109,6 +109,12 @@ public interface ISicarAdapter
     Task<object> GetCategoriesAsync(JsonElement payload, CancellationToken ct);
 
     /// <summary>
+    /// Promociones vigentes con sus renglones de detallepromo (articulo con sus
+    /// codigos, categoria o departamento con su nombre). Solo lectura.
+    /// </summary>
+    Task<object> GetPromotionsAsync(JsonElement payload, CancellationToken ct);
+
+    /// <summary>
     /// Devuelve los departamentos activos, incluidos los que todavia no tienen
     /// ninguna categoria. GET_CATEGORIES no sirve para eso porque parte de la
     /// tabla categoria y un departamento vacio nunca aparece en su JOIN.
